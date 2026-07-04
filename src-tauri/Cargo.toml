@@ -1,0 +1,84 @@
+[package]
+name = "viharaos-desktop"
+version = "0.1.0"
+description = "ViharaOS Desktop — Offline-first Tauri shell"
+authors = ["ViharaOS"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "viharaos_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.0.0", features = ["devtools"] }
+tauri-plugin-updater = "2.0.0"
+tauri-plugin-process = "2.0.0"
+tauri-plugin-fs = "2.0.0"
+tauri-plugin-http = "2.0.0"
+tauri-plugin-notification = "2.0.0"
+tauri-plugin-store = "2.0.0"
+tauri-plugin-shell = "2.0.0"
+tauri-plugin-dialog = "2.0.0"
+tauri-plugin-playwright = { version = "0.4", optional = true }
+
+# Local API server (embedded HTTP server mimicking NestJS API)
+axum = { version = "0.7", features = ["json", "query", "multipart", "tokio"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "blob", "chrono", "serde_json"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+
+# Image processing (variant generation)
+image = "0.25"
+imageproc = { version = "0.25", features = ["rayon"] }
+
+# HTTP client (for sync to remote server)
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Misc
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+thiserror = "1.0"
+anyhow = "1.0"
+dirs = "5.0"
+walkdir = "2.5"
+notify = "6.1"
+
+# Pin ctor to avoid 0.8.0 which has a missing ctor_proc_macro crate issue
+ctor = "0.2"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+e2e-testing = ["dep:tauri-plugin-playwright"]
+
+[profile.release]
+# IMPORTANT: Do NOT set panic = "abort". With panic = "abort", any panic
+# in any thread (including background tasks like the API server or sync
+# worker) kills the entire process immediately, causing the app to crash
+# with no error message. The default "unwind" allows panics to be caught
+# by the tokio runtime and logged instead of crashing the app.
+codegen-units = 1
+lto = true
+opt-level = 2
+strip = "debuginfo"

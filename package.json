@@ -1,0 +1,33 @@
+{
+  "name": "@viharaos/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ViharaOS Desktop — Offline-first Tauri shell with SQLite + cloud sync",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "dev:e2e": "tauri dev --features e2e-testing",
+    "build": "tauri build",
+    "tauri": "tauri",
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test --config e2e/playwright.config.ts",
+    "test:e2e:browser": "playwright test --config e2e/playwright.config.ts --project=browser-only",
+    "test:e2e:tauri": "playwright test --config e2e/playwright.config.ts --project=tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-updater": "^2.0.0",
+    "@tauri-apps/plugin-process": "^2.0.0",
+    "@tauri-apps/plugin-fs": "^2.0.0",
+    "@tauri-apps/plugin-http": "^2.0.0",
+    "@tauri-apps/plugin-notification": "^2.0.0",
+    "@tauri-apps/plugin-store": "^2.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@srsholmes/tauri-playwright": "^0.4.1",
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

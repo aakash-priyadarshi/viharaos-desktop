@@ -1,0 +1,14 @@
+<svg width="220" height="56" viewBox="0 0 220 56" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ViharaOS">
+  <defs>
+    <linearGradient id="vow-saffron" x1="0" y1="0" x2="48" y2="48" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FF9C33"/>
+      <stop offset="0.55" stop-color="#F05D00"/>
+      <stop offset="1" stop-color="#C74302"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="48" height="48" rx="13" fill="url(#vow-saffron)"/>
+  <path d="M28 12 C 21.5 17.5, 16.5 23.5, 16.5 31 C 16.5 37.6, 21.6 43, 28 43.4 C 34.4 43, 39.5 37.6, 39.5 31 C 39.5 23.5, 34.5 17.5, 28 12 Z" fill="#FFF8ED"/>
+  <path d="M28 16 L28 41" stroke="#F05D00" stroke-width="2.2" stroke-linecap="round"/>
+  <circle cx="28" cy="27.5" r="3.2" fill="#C74302"/>
+  <text x="64" y="36" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="26" font-weight="700" fill="#C74302">Vihara<tspan fill="#1A1A2E">OS</tspan></text>
+</svg>

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2/capability",
+  "identifier": "default",
+  "description": "Default capability for ViharaOS desktop app",
+  "windows": ["main", "*"],
+  "permissions": [
+    "core:default",
+    "updater:default",
+    "process:default",
+    "fs:default",
+    "http:default",
+    "notification:default",
+    "store:default",
+    "shell:default",
+    "dialog:default"
+  ]
+}

@@ -1,0 +1,82 @@
+name: Desktop Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Desktop version (e.g. 0.1.2)'
+        required: true
+        type: string
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri CLI
+        shell: bash
+        run: |
+          cargo install tauri-cli --version "^2.0.0" --locked || true
+
+      - name: Build Tauri app (Windows MSI)
+        shell: bash
+        env:
+          # No secrets needed — public repo uses default GITHUB_TOKEN for release upload
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          cd src-tauri
+          cargo tauri build --target x86_64-pc-windows-msv
+
+      - name: Create tag and release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          TAG="desktop-v${VERSION}"
+          git tag "$TAG" || true
+          git push origin "$TAG" || true
+          # Create release (idempotent — if it exists, we just upload more assets)
+          gh release create "$TAG" \
+            --title "ViharaOS Desktop v${VERSION}" \
+            --notes "Desktop release v${VERSION}" \
+            --verify-tag || true
+
+      - name: Upload installers and updater artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          TAG="desktop-v${VERSION}"
+          # Tauri build output (Windows)
+          BUILD_DIR="src-tauri/target/x86_64-pc-windows-msv/release/bundle"
+          # Upload MSI installer
+          find "$BUILD_DIR" -name "*.msi" -exec gh release upload "$TAG" {} --clobber \;
+          # Upload latest.json and signature files (Tauri updater manifest)
+          find "$BUILD_DIR" -name "latest.json" -exec gh release upload "$TAG" {} --clobber \;
+          find "$BUILD_DIR" -name "*.sig" -exec gh release upload "$TAG" {} --clobber \;
+          # Upload NSIS installer if present
+          find "$BUILD_DIR" -name "*-setup.exe" -exec gh release upload "$TAG" {} --clobber \;
+
+      - name: Verify release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="desktop-v${{ inputs.version }}"
+          echo "Release assets for $TAG:"
+          gh release view "$TAG" --json assets --jq '.assets[].name'

@@ -1,0 +1,22 @@
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/
+
+# Node
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Env files — NEVER commit secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
