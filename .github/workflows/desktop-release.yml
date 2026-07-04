@@ -43,7 +43,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           cd src-tauri
-          cargo tauri build --target x86_64-pc-windows-msv
+          cargo tauri build --target x86_64-pc-windows-msvc
 
       - name: Create tag and release
         shell: bash
@@ -66,7 +66,7 @@ jobs:
         run: |
           VERSION="${{ inputs.version }}"
           TAG="desktop-v${VERSION}"
-          BUILD_DIR="src-tauri/target/x86_64-pc-windows-msv/release/bundle"
+          BUILD_DIR="src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
           find "$BUILD_DIR" -name "*.msi" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "latest.json" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "*.sig" -exec gh release upload "$TAG" {} --clobber \;
