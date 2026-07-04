@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Desktop version (e.g. 0.1.2)'
+        description: 'Desktop version (e.g. 0.1.4)'
         required: true
         type: string
 
@@ -30,10 +30,15 @@ jobs:
         run: |
           cargo install tauri-cli --version "^2.0.0" --locked || true
 
+      - name: Install GitHub CLI
+        shell: bash
+        run: |
+          choco install gh -y || true
+          echo "C:\\Program Files\\GitHub CLI" >> $GITHUB_PATH
+
       - name: Build Tauri app (Windows MSI)
         shell: bash
         env:
-          # No secrets needed — public repo uses default GITHUB_TOKEN for release upload
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
@@ -49,7 +54,6 @@ jobs:
           TAG="desktop-v${VERSION}"
           git tag "$TAG" || true
           git push origin "$TAG" || true
-          # Create release (idempotent — if it exists, we just upload more assets)
           gh release create "$TAG" \
             --title "ViharaOS Desktop v${VERSION}" \
             --notes "Desktop release v${VERSION}" \
@@ -62,14 +66,10 @@ jobs:
         run: |
           VERSION="${{ inputs.version }}"
           TAG="desktop-v${VERSION}"
-          # Tauri build output (Windows)
           BUILD_DIR="src-tauri/target/x86_64-pc-windows-msv/release/bundle"
-          # Upload MSI installer
           find "$BUILD_DIR" -name "*.msi" -exec gh release upload "$TAG" {} --clobber \;
-          # Upload latest.json and signature files (Tauri updater manifest)
           find "$BUILD_DIR" -name "latest.json" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "*.sig" -exec gh release upload "$TAG" {} --clobber \;
-          # Upload NSIS installer if present
           find "$BUILD_DIR" -name "*-setup.exe" -exec gh release upload "$TAG" {} --clobber \;
 
       - name: Verify release assets
