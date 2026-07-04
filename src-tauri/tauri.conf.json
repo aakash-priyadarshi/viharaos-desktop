@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../out",
     "devUrl": "http://localhost:3000",
-    "beforeDevCommand": "pnpm --filter @viharaos/web dev",
-    "beforeBuildCommand": "pnpm --filter @viharaos/web build:static"
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
   },
   "app": {
     "windows": [
