@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Desktop version (e.g. 0.1.4)'
+        description: 'Desktop version (e.g. 0.1.5)'
         required: true
         type: string
 
@@ -27,16 +27,19 @@ jobs:
     permissions:
       contents: write
     steps:
+      # actions/checkout@v5 pinned on 2025-11-13
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
+      # actions/setup-node@v5 pinned on 2025-09-03
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: 24
 
+      # dtolnay/rust-toolchain@stable pinned on 2026-07-05
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           targets: ${{ matrix.target }}
 
@@ -52,27 +55,39 @@ jobs:
           choco install gh -y || true
           echo "C:\\Program Files\\GitHub CLI" >> $GITHUB_PATH
 
+      - name: Validate release version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if ! echo "$INPUT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid version '$INPUT_VERSION' — must match ^[0-9]+\.[0-9]+\.[0-9]+$"
+            exit 1
+          fi
+          echo "RELEASE_VERSION=$INPUT_VERSION" >> "$GITHUB_ENV"
+
       - name: Build Tauri app
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          BUILD_TARGET: ${{ matrix.target }}
         run: |
           cd src-tauri
-          cargo tauri build --target ${{ matrix.target }}
+          cargo tauri build --target "$BUILD_TARGET"
 
       - name: Create tag and release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
         run: |
-          VERSION="${{ inputs.version }}"
-          TAG="desktop-v${VERSION}"
+          TAG="desktop-v${RELEASE_VERSION}"
           git tag "$TAG" || true
           git push origin "$TAG" || true
           gh release create "$TAG" \
-            --title "ViharaOS Desktop v${VERSION}" \
-            --notes "Desktop release v${VERSION}" \
+            --title "ViharaOS Desktop v${RELEASE_VERSION}" \
+            --notes "Desktop release v${RELEASE_VERSION}" \
             --verify-tag || true
 
       - name: Upload Windows installers and updater artifacts
@@ -80,9 +95,9 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
         run: |
-          VERSION="${{ inputs.version }}"
-          TAG="desktop-v${VERSION}"
+          TAG="desktop-v${RELEASE_VERSION}"
           BUILD_DIR="src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
           find "$BUILD_DIR" -name "*.msi" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "latest.json" -exec gh release upload "$TAG" {} --clobber \;
@@ -94,11 +109,11 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
+          BUILD_TARGET: ${{ matrix.target }}
         run: |
-          VERSION="${{ inputs.version }}"
-          TAG="desktop-v${VERSION}"
-          TARGET="${{ matrix.target }}"
-          BUILD_DIR="src-tauri/target/${TARGET}/release/bundle"
+          TAG="desktop-v${RELEASE_VERSION}"
+          BUILD_DIR="src-tauri/target/${BUILD_TARGET}/release/bundle"
           # Upload .dmg, .app.tar.gz, latest.json, and .sig files
           find "$BUILD_DIR" -name "*.dmg" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "*.app.tar.gz" -exec gh release upload "$TAG" {} --clobber \;
@@ -109,7 +124,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
         run: |
-          TAG="desktop-v${{ inputs.version }}"
+          TAG="desktop-v${RELEASE_VERSION}"
           echo "Release assets for $TAG:"
           gh release view "$TAG" --json assets --jq '.assets[].name'

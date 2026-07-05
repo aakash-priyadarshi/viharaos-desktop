@@ -1,0 +1,6 @@
+# Generated Next.js static export — do not scan
+out/
+out/_next/
+.next/
+dist/
+build/
