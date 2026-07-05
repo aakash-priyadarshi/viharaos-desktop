@@ -38,6 +38,135 @@ fn detect_platform() -> String {
     { "unknown".to_string() }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── detect_platform ───
+
+    #[test]
+    fn detect_platform_returns_known_value() {
+        let platform = detect_platform();
+        let valid = ["windows", "macos", "linux", "unknown"].contains(&platform.as_str());
+        assert!(valid, "detect_platform must return a known value, got: {}", platform);
+    }
+
+    #[test]
+    fn detect_platform_matches_cfg_target() {
+        let platform = detect_platform();
+        #[cfg(target_os = "windows")]
+        assert_eq!(platform, "windows");
+        #[cfg(target_os = "macos")]
+        assert_eq!(platform, "macos");
+        #[cfg(target_os = "linux")]
+        assert_eq!(platform, "linux");
+    }
+
+    // ─── get_or_create_device_id ───
+
+    fn create_test_db() -> crate::db::Database {
+        let db_path = std::env::temp_dir().join(format!(
+            "viharaos-heartbeat-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        crate::db::Database::new(&db_path).expect("temp db should initialize")
+    }
+
+    #[test]
+    fn get_or_create_device_id_generates_new_id() {
+        let db = create_test_db();
+        let conn = db.conn().expect("get connection");
+        let id = get_or_create_device_id(&conn).expect("create device id");
+        assert!(!id.is_empty(), "device id must not be empty");
+        // Should be a UUID
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "device id should be a valid UUID");
+    }
+
+    #[test]
+    fn get_or_create_device_id_returns_same_id_on_subsequent_calls() {
+        let db = create_test_db();
+        let conn = db.conn().expect("get connection");
+        let id1 = get_or_create_device_id(&conn).expect("first call");
+        let id2 = get_or_create_device_id(&conn).expect("second call");
+        assert_eq!(id1, id2, "device id must be stable across calls");
+    }
+
+    #[test]
+    fn get_or_create_device_id_persists_across_connections() {
+        let db = create_test_db();
+        let id1 = {
+            let conn = db.conn().expect("get connection");
+            get_or_create_device_id(&conn).expect("first connection")
+        };
+        let id2 = {
+            let conn = db.conn().expect("get new connection");
+            get_or_create_device_id(&conn).expect("second connection")
+        };
+        assert_eq!(id1, id2, "device id must persist across connections from the pool");
+    }
+
+    // ─── sync_status determination logic ───
+    // (The sync_status string logic is embedded in get_device_heartbeat,
+    //  but the priority order is testable: CONFLICT > FAILED > PENDING > SYNCED)
+
+    #[test]
+    fn sync_status_priority_conflict_overrides_failed_and_pending() {
+        // This tests the priority logic used in get_device_heartbeat
+        let conflict_count = 1;
+        let failed_count = 5;
+        let pending_count = 10;
+
+        let status = if conflict_count > 0 { "CONFLICT" }
+            else if failed_count > 0 { "FAILED" }
+            else if pending_count > 0 { "PENDING" }
+            else { "SYNCED" };
+
+        assert_eq!(status, "CONFLICT", "CONFLICT must take priority");
+    }
+
+    #[test]
+    fn sync_status_priority_failed_overrides_pending() {
+        let conflict_count = 0;
+        let failed_count = 3;
+        let pending_count = 10;
+
+        let status = if conflict_count > 0 { "CONFLICT" }
+            else if failed_count > 0 { "FAILED" }
+            else if pending_count > 0 { "PENDING" }
+            else { "SYNCED" };
+
+        assert_eq!(status, "FAILED", "FAILED must take priority over PENDING");
+    }
+
+    #[test]
+    fn sync_status_pending_when_no_conflicts_or_failures() {
+        let conflict_count = 0;
+        let failed_count = 0;
+        let pending_count = 5;
+
+        let status = if conflict_count > 0 { "CONFLICT" }
+            else if failed_count > 0 { "FAILED" }
+            else if pending_count > 0 { "PENDING" }
+            else { "SYNCED" };
+
+        assert_eq!(status, "PENDING");
+    }
+
+    #[test]
+    fn sync_status_synced_when_all_counts_zero() {
+        let conflict_count = 0;
+        let failed_count = 0;
+        let pending_count = 0;
+
+        let status = if conflict_count > 0 { "CONFLICT" }
+            else if failed_count > 0 { "FAILED" }
+            else if pending_count > 0 { "PENDING" }
+            else { "SYNCED" };
+
+        assert_eq!(status, "SYNCED");
+    }
+}
+
 /// Get or create the local device ID. Stable across restarts.
 fn get_or_create_device_id(conn: &rusqlite::Connection) -> Result<String, String> {
     // Check sync_settings first

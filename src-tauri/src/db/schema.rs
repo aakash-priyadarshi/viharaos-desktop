@@ -18,6 +18,8 @@ pub fn run_migrations(conn: &Connection) -> DbResult<()> {
         ("006_housekeeping", MIGRATION_006_HOUSEKEEPING),
         ("007_sync_entity", MIGRATION_007_SYNC_ENTITY),
         ("008_device_heartbeat", MIGRATION_008_DEVICE_HEARTBEAT),
+        ("009_password_hash", MIGRATION_009_PASSWORD_HASH),
+        ("010_session_tokens", MIGRATION_010_SESSION_TOKENS),
     ];
 
     conn.execute_batch(
@@ -640,4 +642,34 @@ CREATE TABLE IF NOT EXISTS device_heartbeat (
 
 -- Ensure the device table has a stable row we can reference
 INSERT OR IGNORE INTO device (id, name) VALUES ('local', 'This Desktop');
+"#;
+
+// ─── Migration 009: Password hash for offline auth ───
+
+const MIGRATION_009_PASSWORD_HASH: &str = r#"
+-- Add password_hash column to user table for offline auth verification.
+-- When a user logs in online, the frontend stores an Argon2id hash of their
+-- password here so offline login can verify credentials instead of accepting
+-- any password. Argon2id is the OWASP-recommended password hashing algorithm
+-- (memory-hard, random salt). Legacy SHA-256 hashes are auto-upgraded to
+-- Argon2id on next successful login. NULL means the user hasn't logged in
+-- online yet from this device.
+ALTER TABLE user ADD COLUMN password_hash TEXT;
+"#;
+
+const MIGRATION_010_SESSION_TOKENS: &str = r#"
+-- Session tokens for the local API server authentication.
+-- When a user logs in (online or offline), a session token is generated
+-- and stored here. The local axum API server validates the Authorization
+-- header against this table before serving any request (except /auth/login
+-- and /health).
+CREATE TABLE IF NOT EXISTS session_token (
+    token TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL DEFAULT (datetime('now', '+30 days')),
+    FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_session_token_user ON session_token(user_id);
+CREATE INDEX IF NOT EXISTS idx_session_token_expires ON session_token(expires_at);
 "#;

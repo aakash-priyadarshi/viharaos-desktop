@@ -1,6 +1,6 @@
 {
   "name": "@viharaos/desktop",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "ViharaOS Desktop — Offline-first Tauri shell with SQLite + cloud sync",
   "type": "module",
@@ -10,24 +10,29 @@
     "build": "tauri build",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "test:e2e": "playwright test --config e2e/playwright.config.ts",
     "test:e2e:browser": "playwright test --config e2e/playwright.config.ts --project=browser-only",
     "test:e2e:tauri": "playwright test --config e2e/playwright.config.ts --project=tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-updater": "^2.0.0",
-    "@tauri-apps/plugin-process": "^2.0.0",
     "@tauri-apps/plugin-fs": "^2.0.0",
     "@tauri-apps/plugin-http": "^2.0.0",
     "@tauri-apps/plugin-notification": "^2.0.0",
-    "@tauri-apps/plugin-store": "^2.0.0"
+    "@tauri-apps/plugin-process": "^2.0.0",
+    "@tauri-apps/plugin-store": "^2.0.0",
+    "@tauri-apps/plugin-updater": "^2.0.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",
     "@srsholmes/tauri-playwright": "^0.4.1",
     "@tauri-apps/cli": "^2.0.0",
     "@types/node": "^22.10.2",
-    "typescript": "^5.7.2"
+    "@vitest/coverage-v8": "3.0.0",
+    "jsdom": "25.0.0",
+    "typescript": "^5.7.2",
+    "vitest": "3.0.0"
   }
 }

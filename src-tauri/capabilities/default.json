@@ -1,17 +1,14 @@
 {
   "$schema": "https://schema.tauri.app/config/2/capability",
   "identifier": "default",
-  "description": "Default capability for ViharaOS desktop app",
+  "description": "Default capability for ViharaOS desktop app — scoped to only the permissions the frontend webview actually uses via IPC. Filesystem and HTTP access are handled by custom Rust commands (using std::fs and reqwest directly), not through the tauri-plugin-fs or tauri-plugin-http IPC APIs, so those broad permission sets are intentionally omitted.",
   "windows": ["main", "*"],
   "permissions": [
     "core:default",
     "updater:default",
     "process:default",
-    "fs:default",
-    "http:default",
     "notification:default",
     "store:default",
-    "shell:default",
     "dialog:default"
   ]
 }

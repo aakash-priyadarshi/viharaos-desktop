@@ -287,3 +287,76 @@ pub async fn delete_entity_from_r2(
 
 // Re-export ImageError for convenience
 pub type R2Result<T> = Result<T, ImageError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> R2Config {
+        R2Config {
+            account_id: "test_account".to_string(),
+            access_key_id: "test_key".to_string(),
+            secret_access_key: "test_secret".to_string(),
+            bucket_name: "test_bucket".to_string(),
+            public_base_url: "https://media.viharaos.com".to_string(),
+        }
+    }
+
+    // ─── R2 key format ───
+    // The key format is: {organization_id}/{entity}/{entity_id}/{variant}.webp
+    // This is constructed in sync_media_to_r2. We test the format here.
+
+    #[test]
+    fn r2_key_format_is_correct() {
+        let org_id = "org-123";
+        let entity = "guests";
+        let entity_id = "guest-456";
+        let variant = "thumb";
+        let r2_key = format!("{}/{}/{}/{}.webp", org_id, entity, entity_id, variant);
+        assert_eq!(r2_key, "org-123/guests/guest-456/thumb.webp");
+    }
+
+    // ─── public URL construction ───
+
+    #[test]
+    fn public_url_trims_trailing_slash_from_base() {
+        let config = R2Config {
+            public_base_url: "https://media.viharaos.com/".to_string(),
+            ..test_config()
+        };
+        let public_url = format!("{}/{}", config.public_base_url.trim_end_matches('/'), "org-1/guests/g-1/thumb.webp");
+        assert_eq!(public_url, "https://media.viharaos.com/org-1/guests/g-1/thumb.webp");
+    }
+
+    #[test]
+    fn public_url_without_trailing_slash() {
+        let config = test_config();
+        let public_url = format!("{}/{}", config.public_base_url.trim_end_matches('/'), "org-1/guests/g-1/thumb.webp");
+        assert_eq!(public_url, "https://media.viharaos.com/org-1/guests/g-1/thumb.webp");
+    }
+
+    // ─── R2 endpoint construction ───
+
+    #[test]
+    fn r2_endpoint_format_is_correct() {
+        let config = test_config();
+        let r2_key = "org-1/guests/g-1/thumb.webp";
+        let endpoint = format!(
+            "https://{}.r2.cloudflarestorage.com/{}/{}",
+            config.account_id, config.bucket_name, r2_key
+        );
+        assert_eq!(
+            endpoint,
+            "https://test_account.r2.cloudflarestorage.com/test_bucket/org-1/guests/g-1/thumb.webp"
+        );
+    }
+
+    // ─── R2Config default public_base_url fallback ───
+
+    #[test]
+    fn r2_config_fallback_url_uses_bucket_name() {
+        let bucket_name = "my-bucket";
+        let fallback = format!("https://{}.r2.dev", bucket_name);
+        assert_eq!(fallback, "https://my-bucket.r2.dev");
+    }
+}

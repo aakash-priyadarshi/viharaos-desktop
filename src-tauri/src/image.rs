@@ -131,3 +131,196 @@ pub fn dir_size(path: &Path) -> u64 {
     }
     total
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── dir_size ───
+
+    #[test]
+    fn dir_size_returns_zero_for_nonexistent_path() {
+        let path = std::path::PathBuf::from("/nonexistent/path/that/does/not/exist");
+        assert_eq!(dir_size(&path), 0);
+    }
+
+    #[test]
+    fn dir_size_returns_zero_for_empty_directory() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        assert_eq!(dir_size(dir.path()), 0);
+    }
+
+    #[test]
+    fn dir_size_sums_files_in_directory() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(dir.path().join("a.txt"), b"hello").expect("write a");
+        std::fs::write(dir.path().join("b.txt"), b"world!!").expect("write b");
+        // 5 + 7 = 12 bytes
+        assert_eq!(dir_size(dir.path()), 12);
+    }
+
+    #[test]
+    fn dir_size_recurses_into_subdirectories() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(dir.path().join("top.txt"), b"12345").expect("write top");
+        std::fs::create_dir_all(dir.path().join("sub")).expect("create sub");
+        std::fs::write(dir.path().join("sub").join("inner.txt"), b"abc").expect("write inner");
+        // 5 + 3 = 8 bytes
+        assert_eq!(dir_size(dir.path()), 8);
+    }
+
+    // ─── save_to_file ───
+
+    #[test]
+    fn save_to_file_writes_bytes() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("output.bin");
+        save_to_file(b"test data", &path).expect("save should succeed");
+        let read = std::fs::read(&path).expect("read back");
+        assert_eq!(read, b"test data");
+    }
+
+    #[test]
+    fn save_to_file_creates_parent_directories() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("nested").join("deep").join("file.bin");
+        save_to_file(b"data", &path).expect("save should create parents");
+        assert!(path.exists());
+    }
+
+    // ─── delete_file ───
+
+    #[test]
+    fn delete_file_removes_existing_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("to_delete.txt");
+        std::fs::write(&path, b"data").expect("write file");
+        assert!(path.exists());
+        delete_file(&path).expect("delete should succeed");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn delete_file_does_not_error_on_missing_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("nonexistent.txt");
+        // Should not error
+        delete_file(&path).expect("deleting non-existent file should be ok");
+    }
+
+    // ─── generate_variants ───
+
+    fn make_test_png(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbaImage::new(width, height);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, ImageFormat::Png)
+            .expect("encode test PNG");
+        buf.into_inner()
+    }
+
+    #[test]
+    fn generate_variants_produces_three_webp_variants() {
+        let png = make_test_png(800, 600);
+        let variants = generate_variants(&png).expect("variants should generate");
+        // All three variants should be non-empty WebP data
+        assert!(!variants.original.is_empty(), "original must not be empty");
+        assert!(!variants.medium.is_empty(), "medium must not be empty");
+        assert!(!variants.thumb.is_empty(), "thumb must not be empty");
+        // Original dimensions should match source
+        assert_eq!(variants.original_width, 800);
+        assert_eq!(variants.original_height, 600);
+    }
+
+    #[test]
+    fn generate_variants_thumb_is_150x150() {
+        let png = make_test_png(800, 600);
+        let variants = generate_variants(&png).expect("variants should generate");
+        // Decode the thumb to verify dimensions
+        let thumb_img = ImageReader::new(Cursor::new(&variants.thumb))
+            .with_guessed_format()
+            .expect("guess format")
+            .decode()
+            .expect("decode thumb");
+        assert_eq!(thumb_img.width(), 150, "thumb must be 150px wide");
+        assert_eq!(thumb_img.height(), 150, "thumb must be 150px tall");
+    }
+
+    #[test]
+    fn generate_variants_rejects_invalid_image_data() {
+        let result = generate_variants(b"this is not an image");
+        assert!(result.is_err(), "invalid image data should produce error");
+    }
+
+    #[test]
+    fn generate_variants_handles_small_image_without_upscaling() {
+        // 50x50 image — smaller than all variant maxes
+        let png = make_test_png(50, 50);
+        let variants = generate_variants(&png).expect("variants should generate");
+        // Original should preserve dimensions
+        assert_eq!(variants.original_width, 50);
+        assert_eq!(variants.original_height, 50);
+        // Thumb should still be 150x150 (upscaled for thumbnail)
+        let thumb_img = ImageReader::new(Cursor::new(&variants.thumb))
+            .with_guessed_format()
+            .expect("guess format")
+            .decode()
+            .expect("decode thumb");
+        assert_eq!(thumb_img.width(), 150);
+        assert_eq!(thumb_img.height(), 150);
+    }
+
+    #[test]
+    fn generate_variants_handles_square_image() {
+        let png = make_test_png(400, 400);
+        let variants = generate_variants(&png).expect("variants should generate");
+        assert_eq!(variants.original_width, 400);
+        assert_eq!(variants.original_height, 400);
+    }
+
+    // ─── resize_to_max (tested indirectly via generate_variants) ───
+
+    #[test]
+    fn resize_to_max_does_not_upscale_when_within_limit() {
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::new(100, 80));
+        let resized = resize_to_max(&img, 200);
+        assert_eq!(resized.width(), 100, "should not upscale width");
+        assert_eq!(resized.height(), 80, "should not upscale height");
+    }
+
+    #[test]
+    fn resize_to_max_scales_down_landscape_image() {
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::new(2000, 1000));
+        let resized = resize_to_max(&img, 1024);
+        assert_eq!(resized.width(), 1024, "width should be capped at max");
+        assert!(resized.height() <= 1024, "height should maintain aspect ratio");
+    }
+
+    #[test]
+    fn resize_to_max_scales_down_portrait_image() {
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::new(1000, 2000));
+        let resized = resize_to_max(&img, 1024);
+        assert_eq!(resized.height(), 1024, "height should be capped at max");
+        assert!(resized.width() <= 1024, "width should maintain aspect ratio");
+    }
+
+    // ─── crop_square ───
+
+    #[test]
+    fn crop_square_produces_square_output() {
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::new(300, 200));
+        let cropped = crop_square(&img, 100);
+        assert_eq!(cropped.width(), 100);
+        assert_eq!(cropped.height(), 100);
+    }
+
+    #[test]
+    fn crop_square_centers_crop_on_landscape() {
+        // 300x200 → crop 200x200 from center → x offset = (300-200)/2 = 50
+        // We verify by checking the output is square 100x100 after resize
+        let img = DynamicImage::ImageRgba8(image::RgbaImage::new(300, 200));
+        let cropped = crop_square(&img, 100);
+        assert_eq!(cropped.width(), 100);
+        assert_eq!(cropped.height(), 100);
+    }
+}

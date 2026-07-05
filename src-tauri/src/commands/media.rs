@@ -245,11 +245,15 @@ pub async fn get_local_image_path(
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
     let full_path = state.images_dir.join(&relative_path);
-    if full_path.exists() {
-        Ok(full_path.to_string_lossy().to_string())
-    } else {
-        Err("Image not found locally".to_string())
+    // Prevent path traversal — canonicalize and verify it's within images_dir
+    let canonical_base = state.images_dir.canonicalize()
+        .map_err(|e| format!("Invalid images dir: {}", e))?;
+    let canonical_path = full_path.canonicalize()
+        .map_err(|_| "Image not found locally".to_string())?;
+    if !canonical_path.starts_with(&canonical_base) {
+        return Err("Image not found locally".to_string());
     }
+    Ok(canonical_path.to_string_lossy().to_string())
 }
 
 /// Check current storage usage against quota
@@ -379,4 +383,155 @@ fn delete_old_variants(
     .map_err(|_| ImageError::Save("Delete error".to_string()))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_folder_permission;
+
+    // ─── Admin roles → all folders ───
+
+    #[test]
+    fn platform_admin_can_access_all_folders() {
+        for entity in &["guests", "employees", "menu-items", "rooms", "visitors", "lost-found"] {
+            assert!(check_folder_permission("PLATFORM_ADMIN", entity),
+                "PLATFORM_ADMIN should access '{}'", entity);
+        }
+    }
+
+    #[test]
+    fn hotel_admin_can_access_all_folders() {
+        for entity in &["guests", "employees", "menu-items", "rooms"] {
+            assert!(check_folder_permission("HOTEL_ADMIN", entity),
+                "HOTEL_ADMIN should access '{}'", entity);
+        }
+    }
+
+    #[test]
+    fn owner_can_access_all_folders() {
+        for entity in &["guests", "employees", "menu-items", "rooms"] {
+            assert!(check_folder_permission("OWNER", entity),
+                "OWNER should access '{}'", entity);
+        }
+    }
+
+    // ─── General Manager → all except employees ───
+
+    #[test]
+    fn gm_can_access_non_hr_folders() {
+        assert!(check_folder_permission("GENERAL_MANAGER", "guests"));
+        assert!(check_folder_permission("GENERAL_MANAGER", "menu-items"));
+        assert!(check_folder_permission("GENERAL_MANAGER", "rooms"));
+    }
+
+    #[test]
+    fn gm_cannot_access_employees() {
+        assert!(!check_folder_permission("GENERAL_MANAGER", "employees"),
+            "GM must not access employees (HR-only)");
+    }
+
+    // ─── Receptionist → guests, visitors only ───
+
+    #[test]
+    fn receptionist_can_access_guests_and_visitors() {
+        assert!(check_folder_permission("RECEPTIONIST", "guests"));
+        assert!(check_folder_permission("RECEPTIONIST", "visitors"));
+    }
+
+    #[test]
+    fn receptionist_cannot_access_other_folders() {
+        assert!(!check_folder_permission("RECEPTIONIST", "employees"));
+        assert!(!check_folder_permission("RECEPTIONIST", "menu-items"));
+        assert!(!check_folder_permission("RECEPTIONIST", "rooms"));
+    }
+
+    #[test]
+    fn front_desk_alias_works() {
+        assert!(check_folder_permission("FRONT_DESK", "guests"));
+        assert!(check_folder_permission("FRONT_DESK", "visitors"));
+        assert!(!check_folder_permission("FRONT_DESK", "employees"));
+    }
+
+    // ─── Kitchen → menu-items only ───
+
+    #[test]
+    fn kitchen_can_access_menu_items() {
+        assert!(check_folder_permission("KITCHEN", "menu-items"));
+        assert!(check_folder_permission("CHEF", "menu-items"));
+    }
+
+    #[test]
+    fn kitchen_cannot_access_other_folders() {
+        assert!(!check_folder_permission("KITCHEN", "guests"));
+        assert!(!check_folder_permission("KITCHEN", "employees"));
+        assert!(!check_folder_permission("KITCHEN", "rooms"));
+    }
+
+    // ─── HR → employees only ───
+
+    #[test]
+    fn hr_can_access_employees() {
+        assert!(check_folder_permission("HR", "employees"));
+        assert!(check_folder_permission("HR_MANAGER", "employees"));
+    }
+
+    #[test]
+    fn hr_cannot_access_other_folders() {
+        assert!(!check_folder_permission("HR", "guests"));
+        assert!(!check_folder_permission("HR", "menu-items"));
+    }
+
+    // ─── Security → visitors, lost-found ───
+
+    #[test]
+    fn security_can_access_visitors_and_lost_found() {
+        assert!(check_folder_permission("SECURITY", "visitors"));
+        assert!(check_folder_permission("SECURITY", "lost-found"));
+        assert!(check_folder_permission("SECURITY_OFFICER", "visitors"));
+    }
+
+    #[test]
+    fn security_cannot_access_other_folders() {
+        assert!(!check_folder_permission("SECURITY", "guests"));
+        assert!(!check_folder_permission("SECURITY", "employees"));
+    }
+
+    // ─── Housekeeping → rooms only ───
+
+    #[test]
+    fn housekeeping_can_access_rooms() {
+        assert!(check_folder_permission("HOUSEKEEPING", "rooms"));
+    }
+
+    #[test]
+    fn housekeeping_cannot_access_other_folders() {
+        assert!(!check_folder_permission("HOUSEKEEPING", "guests"));
+        assert!(!check_folder_permission("HOUSEKEEPING", "menu-items"));
+    }
+
+    // ─── Waiter/Steward → menu-items ───
+
+    #[test]
+    fn waiter_can_access_menu_items() {
+        assert!(check_folder_permission("WAITER", "menu-items"));
+        assert!(check_folder_permission("STEWARD", "menu-items"));
+    }
+
+    // ─── Unknown role → deny all ───
+
+    #[test]
+    fn unknown_role_denied_everywhere() {
+        assert!(!check_folder_permission("UNKNOWN_ROLE", "guests"));
+        assert!(!check_folder_permission("UNKNOWN_ROLE", "menu-items"));
+        assert!(!check_folder_permission("", "guests"));
+    }
+
+    // ─── Case insensitivity ───
+
+    #[test]
+    fn permission_check_is_case_insensitive() {
+        assert!(check_folder_permission("platform_admin", "guests"));
+        assert!(check_folder_permission("Platform_Admin", "guests"));
+        assert!(check_folder_permission("receptionist", "guests"));
+    }
 }

@@ -129,7 +129,6 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init());
 
     #[cfg(feature = "e2e-testing")]
@@ -243,6 +242,7 @@ pub fn run() {
             commands::conflicts::resolve_conflict_keep_local,
             commands::conflicts::resolve_conflict_accept_server,
             commands::conflicts::resolve_conflict_manual,
+            commands::api::store_password_hash,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ViharaOS desktop");

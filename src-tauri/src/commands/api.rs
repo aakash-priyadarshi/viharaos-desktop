@@ -8,9 +8,82 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Sha256, Digest};
+use tower_http::cors::{CorsLayer, Any, AllowOrigin};
+use axum::http::HeaderValue;
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
+};
 
 use crate::AppState;
 use crate::db::models::*;
+
+/// Hash a password with Argon2id for offline verification.
+/// Argon2id is the recommended password hashing algorithm (OWASP, PHC).
+/// It uses a random salt and memory-hard key derivation to resist GPU/ASIC
+/// brute-force attacks. The resulting PHC string is stored in the database.
+fn hash_password(password: &str) -> String {
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .unwrap_or_else(|_| {
+            // Fallback to SHA-256 if Argon2 fails (should never happen)
+            let mut hasher = Sha256::new();
+            hasher.update(password.as_bytes());
+            hex::encode(hasher.finalize())
+        })
+}
+
+/// Verify a password against a stored hash.
+/// Supports both Argon2id (PHC format) and legacy SHA-256 hex (64 chars).
+/// Legacy SHA-256 hashes are transparently upgraded to Argon2id on next login.
+fn verify_password(password: &str, stored_hash: &str) -> bool {
+    // Argon2id hashes start with "$argon2" (PHC format)
+    if stored_hash.starts_with("$argon2") {
+        if let Ok(parsed) = PasswordHash::new(stored_hash) {
+            return Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok();
+        }
+        return false;
+    }
+    // Legacy SHA-256 fallback (64 hex chars, no salt)
+    if stored_hash.len() == 64 && stored_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        let mut hasher = Sha256::new();
+        hasher.update(password.as_bytes());
+        let input_hash = hex::encode(hasher.finalize());
+        return input_hash == stored_hash;
+    }
+    false
+}
+
+/// Check if a stored hash is a legacy SHA-256 hash that should be upgraded.
+fn is_legacy_hash(stored_hash: &str) -> bool {
+    !stored_hash.starts_with("$argon2")
+}
+
+/// Map an error to a 500 response, logging the full error but returning
+/// a generic message to the client. Prevents leaking internal error details
+/// (e.g. SQL errors, file paths) in HTTP responses.
+fn internal_error<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
+    log::error!("Internal error: {}", e);
+    (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
+}
+
+/// Verify that a joined path stays within the allowed base directory.
+/// Prevents path traversal attacks (e.g., `/images/../../etc/passwd`).
+fn safe_join(base: &std::path::Path, relative: &str) -> Result<std::path::PathBuf, String> {
+    let joined = base.join(relative);
+    let canonical_base = base.canonicalize().map_err(|e| format!("Invalid base dir: {}", e))?;
+    let canonical_joined = joined.canonicalize().map_err(|_| "Path not found".to_string())?;
+    if !canonical_joined.starts_with(&canonical_base) {
+        return Err("Path traversal denied".to_string());
+    }
+    Ok(canonical_joined)
+}
 
 /// Merge a serde_json::Value object with additional key-value pairs.
 /// Returns a new JSON object containing all keys from `base` plus the overrides.
@@ -21,6 +94,59 @@ fn merge_json(mut base: Value, overrides: &[(&str, Value)]) -> Value {
         }
     }
     base
+}
+
+/// Extract a Bearer token from the Authorization header.
+fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    let auth_header = headers.get(axum::http::header::AUTHORIZATION)?;
+    let auth_str = auth_header.to_str().ok()?;
+    if auth_str.starts_with("Bearer ") {
+        Some(auth_str[7..].to_string())
+    } else {
+        None
+    }
+}
+
+/// Axum middleware that validates the Bearer token against the session_token table.
+/// Requests to /api/auth/login and /api/health are exempt (no auth required).
+async fn auth_middleware(
+    AxumState(state): AxumState<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let path = request.uri().path();
+
+    // Exempt routes that don't require authentication:
+    // - /api/health: health check (no sensitive data)
+    // - /api/auth/login: login endpoint (issues tokens)
+    // - /api/auth/refresh: refresh endpoint (uses refresh token, not access token)
+    // - /images/: static image serving (loaded via <img> tags without auth headers;
+    //   CORS restriction already prevents other origins from accessing these)
+    if path == "/api/health" || path == "/api/auth/login" || path == "/api/auth/refresh" || path.starts_with("/images/") {
+        return Ok(next.run(request).await);
+    }
+
+    // Extract and validate the Bearer token
+    let token = extract_bearer_token(request.headers())
+        .ok_or((StatusCode::UNAUTHORIZED, "Missing or invalid Authorization header".to_string()))?;
+
+    let conn = state.db.conn().map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "Database unavailable".to_string())
+    })?;
+
+    let valid: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_token WHERE token = ?1 AND expires_at > datetime('now'))",
+            rusqlite::params![token],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !valid {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid or expired session token".to_string()));
+    }
+
+    Ok(next.run(request).await)
 }
 
 /// Start the embedded local API server on localhost port 14000.
@@ -51,7 +177,7 @@ pub async fn start_server(state: Arc<AppState>) -> Result<(), String> {
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
-    let shared_state = axum::extract::State(state.clone());
+    let auth_state = state.clone();
 
     Router::new()
         // Health check
@@ -96,6 +222,24 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Static image serving (local filesystem)
         .route("/images/{*path}", get(serve_image))
         .with_state(state)
+        // Auth middleware: validates Bearer token against session_token table
+        // for all routes except /api/health and /api/auth/login.
+        .layer(axum::middleware::from_fn_with_state(auth_state, auth_middleware))
+        // CORS: restrict to the Tauri webview origin and localhost dev server.
+        // Without this, any web page in the user's browser can read local API
+        // responses from http://127.0.0.1:14000, leaking hotel data.
+        // Use AllowOrigin::list() instead of chained allow_origin() calls —
+        // chained calls on CorsLayer overwrite (each call replaces the previous
+        // value), so only the last origin would be allowed. list() sets all
+        // origins in a single call.
+        .layer(CorsLayer::new()
+            .allow_origin(AllowOrigin::list([
+                "tauri://localhost".parse::<HeaderValue>().unwrap(),
+                "http://tauri.localhost".parse::<HeaderValue>().unwrap(),
+                "http://localhost:3000".parse::<HeaderValue>().unwrap(),
+            ]))
+            .allow_methods(Any)
+            .allow_headers(Any))
 }
 
 // ─── Handlers ───
@@ -114,13 +258,13 @@ async fn auth_login(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    let conn = state.db.conn().map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "Database unavailable".to_string())
     })?;
 
-    let user: Option<(String, String, String, String, Option<String>, Option<String>)> = conn
+    let user: Option<(String, String, String, String, Option<String>, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT id, email, name, role, organization_id, property_id
+            "SELECT id, email, name, role, organization_id, property_id, password_hash
              FROM user WHERE email = ?1 AND is_active = 1",
             rusqlite::params![req.email],
             |row| Ok((
@@ -130,15 +274,58 @@ async fn auth_login(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             )),
         )
         .ok();
 
     match user {
-        Some((id, email, name, role, org_id, prop_id)) => {
-            // TODO: Verify password hash
-            // For now, accept any password (offline mode — user already authenticated on server)
+        Some((id, email, name, role, org_id, prop_id, password_hash)) => {
+            // Verify password against stored hash if one exists.
+            // If no hash is stored, the user hasn't logged in online from this
+            // device yet — reject offline login to prevent auth bypass.
+            if let Some(ref stored_hash) = password_hash {
+                if !verify_password(&req.password, stored_hash) {
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        "Invalid credentials".to_string(),
+                    ));
+                }
+                // Upgrade legacy SHA-256 hashes to Argon2id on successful login
+                if is_legacy_hash(stored_hash) {
+                    let new_hash = hash_password(&req.password);
+                    let _ = conn.execute(
+                        "UPDATE user SET password_hash = ?1 WHERE id = ?2",
+                        rusqlite::params![new_hash, id],
+                    );
+                    log::info!("Upgraded password hash from SHA-256 to Argon2id for user '{}'", email);
+                }
+            } else {
+                // No password hash stored — can't verify offline
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "Offline login not available. Please log in online first to enable offline access.".to_string(),
+                ));
+            }
+
+            // Update last_login_at
+            let _ = conn.execute(
+                "UPDATE user SET last_login_at = datetime('now') WHERE id = ?1",
+                rusqlite::params![id],
+            );
+
+            // Generate a session token and store it for API auth
             let token = format!("offline-token-{}", uuid::Uuid::new_v4());
+            let _ = conn.execute(
+                "INSERT INTO session_token (token, user_id) VALUES (?1, ?2)",
+                rusqlite::params![token, id],
+            );
+            // Clean up expired tokens
+            let _ = conn.execute(
+                "DELETE FROM session_token WHERE expires_at < datetime('now')",
+                [],
+            );
+
             Ok(Json(json!({
                 "accessToken": token,
                 "user": {
@@ -160,17 +347,23 @@ async fn auth_login(
 
 async fn auth_me(
     AxumState(state): AxumState<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    // Validate the Authorization header against the session_token table
+    let token = extract_bearer_token(&headers)
+        .ok_or((StatusCode::UNAUTHORIZED, "Missing or invalid Authorization header".to_string()))?;
+
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let user = conn
         .query_row(
-            "SELECT id, email, name, role, organization_id, property_id
-             FROM user WHERE is_active = 1
-             ORDER BY last_login_at DESC LIMIT 1",
-            [],
+            "SELECT u.id, u.email, u.name, u.role, u.organization_id, u.property_id
+             FROM session_token st
+             JOIN user u ON u.id = st.user_id
+             WHERE st.token = ?1 AND st.expires_at > datetime('now') AND u.is_active = 1",
+            rusqlite::params![token],
             |row| Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "email": row.get::<_, String>(1)?,
@@ -211,12 +404,16 @@ async fn list_guests(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let limit = q.limit.unwrap_or(50).min(200);
     let offset = q.offset.unwrap_or(0);
     let property_id = q.property_id.unwrap_or_default();
+    // Escape LIKE wildcard characters (% and _) in the search term so that
+    // user input is treated as a literal substring, not a wildcard pattern.
+    // The backslash is used as the ESCAPE character in the SQL below.
+    let search = q.search.unwrap_or_default().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
 
     let mut stmt = conn
         .prepare(
@@ -225,15 +422,15 @@ async fn list_guests(
                     loyalty_points, created_at
              FROM guest
              WHERE (?1 = '' OR property_id = ?1)
-             AND (?2 = '' OR first_name LIKE '%' || ?2 || '%' OR last_name LIKE '%' || ?2 || '%' OR phone LIKE '%' || ?2 || '%')
+             AND (?2 = '' OR first_name LIKE '%' || ?2 || '%' ESCAPE '\\' OR last_name LIKE '%' || ?2 || '%' ESCAPE '\\' OR phone LIKE '%' || ?2 || '%' ESCAPE '\\')
              ORDER BY created_at DESC
              LIMIT ?3 OFFSET ?4",
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let rows = stmt
         .query_map(
-            rusqlite::params![property_id, q.search.unwrap_or_default(), limit, offset],
+            rusqlite::params![property_id, search, limit, offset],
             |row| {
                 Ok(json!({
                     "id": row.get::<_, String>(0)?,
@@ -253,7 +450,7 @@ async fn list_guests(
                 }))
             },
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let guests: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
     Ok(Json(json!({ "data": guests, "count": guests.len() })))
@@ -265,7 +462,7 @@ async fn create_guest(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     conn.execute(
@@ -284,7 +481,7 @@ async fn create_guest(
             req["notes"].as_str(),
         ],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     // Queue sync
     queue_sync(&conn, "guest", &id, "CREATE", &req)?;
@@ -297,7 +494,7 @@ async fn get_guest(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let guest = conn
@@ -350,7 +547,7 @@ async fn update_guest(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     // Dynamic update — build SET clause from provided fields
@@ -360,28 +557,28 @@ async fn update_guest(
             "UPDATE guest SET first_name = ?1, local_updated_at = datetime('now') WHERE id = ?2",
             rusqlite::params![name, id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
     if let Some(last) = req["lastName"].as_str() {
         conn.execute(
             "UPDATE guest SET last_name = ?1, local_updated_at = datetime('now') WHERE id = ?2",
             rusqlite::params![last, id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
     if let Some(phone) = req["phone"].as_str() {
         conn.execute(
             "UPDATE guest SET phone = ?1, local_updated_at = datetime('now') WHERE id = ?2",
             rusqlite::params![phone, id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
     if let Some(email) = req["email"].as_str() {
         conn.execute(
             "UPDATE guest SET email = ?1, local_updated_at = datetime('now') WHERE id = ?2",
             rusqlite::params![email, id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
 
     queue_sync(&conn, "guest", &id, "UPDATE", &req)?;
@@ -394,11 +591,11 @@ async fn delete_guest(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     conn.execute("DELETE FROM guest WHERE id = ?1", rusqlite::params![id])
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "guest", &id, "DELETE", &json!({}))?;
 
@@ -412,7 +609,7 @@ async fn list_rooms(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let property_id = q.property_id.unwrap_or_default();
@@ -423,7 +620,7 @@ async fn list_rooms(
              WHERE (?1 = '' OR property_id = ?1)
              ORDER BY number ASC",
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let rows = stmt
         .query_map(rusqlite::params![property_id], |row| {
@@ -439,7 +636,7 @@ async fn list_rooms(
                 "notes": row.get::<_, Option<String>>(8)?,
             }))
         })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let rooms: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
     Ok(Json(json!({ "data": rooms, "count": rooms.len() })))
@@ -450,7 +647,7 @@ async fn get_room(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let room = conn
@@ -486,7 +683,7 @@ async fn update_room(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     if let Some(notes) = req["notes"].as_str() {
@@ -494,7 +691,7 @@ async fn update_room(
             "UPDATE room SET notes = ?1, local_updated_at = datetime('now') WHERE id = ?2",
             rusqlite::params![notes, id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
 
     queue_sync(&conn, "room", &id, "UPDATE", &req)?;
@@ -512,14 +709,14 @@ async fn update_room_status(
     ))?;
 
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     conn.execute(
         "UPDATE room SET status = ?1, local_updated_at = datetime('now') WHERE id = ?2",
         rusqlite::params![status, id],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "room", &id, "UPDATE", &req)?;
     Ok(Json(json!({ "id": id, "status": status })))
@@ -532,7 +729,7 @@ async fn list_reservations(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let property_id = q.property_id.unwrap_or_default();
@@ -550,7 +747,7 @@ async fn list_reservations(
              WHERE (?1 = '' OR r.property_id = ?1)
              ORDER BY r.check_in_date DESC",
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let rows = stmt
         .query_map(rusqlite::params![property_id], |row| {
@@ -578,7 +775,7 @@ async fn list_reservations(
                 "roomNumber": row.get::<_, Option<String>>(20)?,
             }))
         })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let reservations: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
     Ok(Json(json!({ "data": reservations, "count": reservations.len() })))
@@ -590,7 +787,7 @@ async fn create_reservation(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     conn.execute(
@@ -614,7 +811,7 @@ async fn create_reservation(
             req["createdBy"].as_str(),
         ],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "reservation", &id, "CREATE", &req)?;
     Ok(Json(merge_json(req, &[("id", json!(id))])))
@@ -625,7 +822,7 @@ async fn get_reservation(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let res = conn
@@ -671,7 +868,7 @@ async fn update_reservation(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     if let Some(status) = req["status"].as_str() {
@@ -679,14 +876,14 @@ async fn update_reservation(
             "UPDATE reservation SET status = ?1, local_updated_at = datetime('now') WHERE id = ?2",
             rusqlite::params![status, id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
     if let Some(room_id) = req["roomId"].as_str() {
         conn.execute(
             "UPDATE reservation SET room_id = ?1, local_updated_at = datetime('now') WHERE id = ?2",
             rusqlite::params![room_id, id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
 
     queue_sync(&conn, "reservation", &id, "UPDATE", &req)?;
@@ -698,11 +895,11 @@ async fn delete_reservation(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     conn.execute("DELETE FROM reservation WHERE id = ?1", rusqlite::params![id])
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "reservation", &id, "DELETE", &json!({}))?;
     Ok(Json(json!({ "id": id, "deleted": true })))
@@ -714,7 +911,7 @@ async fn check_in(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -722,7 +919,7 @@ async fn check_in(
         "UPDATE reservation SET status = 'CHECKED_IN', checked_in_at = ?1, local_updated_at = datetime('now') WHERE id = ?2",
         rusqlite::params![now, id],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     // Update room status to occupied
     if let Some(room_id) = req["roomId"].as_str() {
@@ -730,7 +927,7 @@ async fn check_in(
             "UPDATE room SET status = 'OCCUPIED', local_updated_at = datetime('now') WHERE id = ?1",
             rusqlite::params![room_id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
 
     queue_sync(&conn, "reservation", &id, "UPDATE", &json!({ "status": "CHECKED_IN", "checkedInAt": now }))?;
@@ -743,7 +940,7 @@ async fn check_out(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -751,7 +948,7 @@ async fn check_out(
         "UPDATE reservation SET status = 'CHECKED_OUT', checked_out_at = ?1, local_updated_at = datetime('now') WHERE id = ?2",
         rusqlite::params![now, id],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     // Update room status to dirty
     if let Some(room_id) = req["roomId"].as_str() {
@@ -759,7 +956,7 @@ async fn check_out(
             "UPDATE room SET status = 'DIRTY', local_updated_at = datetime('now') WHERE id = ?1",
             rusqlite::params![room_id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
 
     queue_sync(&conn, "reservation", &id, "UPDATE", &json!({ "status": "CHECKED_OUT", "checkedOutAt": now }))?;
@@ -773,7 +970,7 @@ async fn list_menu_items(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let property_id = q.property_id.unwrap_or_default();
@@ -784,7 +981,7 @@ async fn list_menu_items(
              WHERE (?1 = '' OR property_id = ?1)
              ORDER BY name ASC",
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let rows = stmt
         .query_map(rusqlite::params![property_id], |row| {
@@ -802,7 +999,7 @@ async fn list_menu_items(
                 "prepTimeMinutes": row.get::<_, Option<i32>>(10)?,
             }))
         })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let items: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
     Ok(Json(json!({ "data": items, "count": items.len() })))
@@ -813,7 +1010,7 @@ async fn get_menu_item(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let item = conn
@@ -851,7 +1048,7 @@ async fn update_menu_item(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     if let Some(price) = req["price"].as_f64() {
@@ -859,14 +1056,14 @@ async fn update_menu_item(
             "UPDATE menu_item SET price = ?1, local_updated_at = datetime('now') WHERE id = ?2",
             rusqlite::params![price, id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
     if let Some(available) = req["isAvailable"].as_bool() {
         conn.execute(
             "UPDATE menu_item SET is_available = ?1, local_updated_at = datetime('now') WHERE id = ?2",
             rusqlite::params![available, id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
 
     queue_sync(&conn, "menu-item", &id, "UPDATE", &req)?;
@@ -880,7 +1077,7 @@ async fn list_orders(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let property_id = q.property_id.unwrap_or_default();
@@ -893,7 +1090,7 @@ async fn list_orders(
              WHERE (?1 = '' OR property_id = ?1)
              ORDER BY created_at DESC",
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let rows = stmt
         .query_map(rusqlite::params![property_id], |row| {
@@ -917,7 +1114,7 @@ async fn list_orders(
                 "updatedAt": row.get::<_, String>(16)?,
             }))
         })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let orders: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
     Ok(Json(json!({ "data": orders, "count": orders.len() })))
@@ -930,7 +1127,7 @@ async fn create_order(
     let id = uuid::Uuid::new_v4().to_string();
     let order_number = format!("ORD-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     conn.execute(
@@ -954,7 +1151,7 @@ async fn create_order(
             req["servedBy"].as_str(),
         ],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "pos-order", &id, "CREATE", &req)?;
     Ok(Json(merge_json(req, &[("id", json!(id)), ("orderNumber", json!(order_number))])))
@@ -965,7 +1162,7 @@ async fn get_order(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let order = conn
@@ -1011,7 +1208,7 @@ async fn update_order(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     if let Some(status) = req["status"].as_str() {
@@ -1019,7 +1216,7 @@ async fn update_order(
             "UPDATE pos_order SET status = ?1, local_updated_at = datetime('now') WHERE id = ?2",
             rusqlite::params![status, id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
 
     queue_sync(&conn, "pos-order", &id, "UPDATE", &req)?;
@@ -1033,7 +1230,7 @@ async fn add_order_item(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     conn.execute(
@@ -1050,7 +1247,7 @@ async fn add_order_item(
             req["status"].as_str().unwrap_or("PENDING"),
         ],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     Ok(Json(merge_json(req, &[("id", json!(id)), ("orderId", json!(order_id))])))
 }
@@ -1062,7 +1259,7 @@ async fn list_folios(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let property_id = q.property_id.unwrap_or_default();
@@ -1077,7 +1274,7 @@ async fn list_folios(
              WHERE (?1 = '' OR f.property_id = ?1)
              ORDER BY f.created_at DESC",
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let rows = stmt
         .query_map(rusqlite::params![property_id], |row| {
@@ -1098,7 +1295,7 @@ async fn list_folios(
                 "guestLastName": row.get::<_, Option<String>>(13)?,
             }))
         })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let folios: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
     Ok(Json(json!({ "data": folios, "count": folios.len() })))
@@ -1111,7 +1308,7 @@ async fn create_folio(
     let id = uuid::Uuid::new_v4().to_string();
     let folio_number = format!("FOL-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     conn.execute(
@@ -1126,7 +1323,7 @@ async fn create_folio(
             req["currency"].as_str().unwrap_or("INR"),
         ],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "folio", &id, "CREATE", &req)?;
     Ok(Json(merge_json(req, &[("id", json!(id)), ("folioNumber", json!(folio_number))])))
@@ -1137,7 +1334,7 @@ async fn get_folio(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let folio = conn
@@ -1178,7 +1375,7 @@ async fn add_folio_charge(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let amount = req["amount"].as_f64().unwrap_or(0.0);
@@ -1201,7 +1398,7 @@ async fn add_folio_charge(
             req["postedBy"].as_str(),
         ],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     // Update folio totals
     conn.execute(
@@ -1212,7 +1409,7 @@ async fn add_folio_charge(
          WHERE id = ?1",
         rusqlite::params![folio_id],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "folio-charge", &id, "CREATE", &req)?;
     Ok(Json(merge_json(req, &[("id", json!(id)), ("folioId", json!(folio_id)), ("totalAmount", json!(total))])))
@@ -1225,7 +1422,7 @@ async fn add_folio_payment(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let amount = req["amount"].as_f64().unwrap_or(0.0);
@@ -1242,7 +1439,7 @@ async fn add_folio_payment(
             req["receivedBy"].as_str(),
         ],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     // Update folio totals
     conn.execute(
@@ -1253,7 +1450,7 @@ async fn add_folio_payment(
          WHERE id = ?1",
         rusqlite::params![folio_id],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "folio-payment", &id, "CREATE", &req)?;
     Ok(Json(merge_json(req, &[("id", json!(id)), ("folioId", json!(folio_id)), ("amount", json!(amount))])))
@@ -1266,7 +1463,7 @@ async fn list_hk_tasks(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     let property_id = q.property_id.unwrap_or_default();
@@ -1280,7 +1477,7 @@ async fn list_hk_tasks(
              WHERE (?1 = '' OR t.property_id = ?1)
              ORDER BY t.created_at DESC",
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let rows = stmt
         .query_map(rusqlite::params![property_id], |row| {
@@ -1298,7 +1495,7 @@ async fn list_hk_tasks(
                 "roomNumber": row.get::<_, Option<String>>(10)?,
             }))
         })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
 
     let tasks: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
     Ok(Json(json!({ "data": tasks, "count": tasks.len() })))
@@ -1310,7 +1507,7 @@ async fn create_hk_task(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     conn.execute(
@@ -1327,7 +1524,7 @@ async fn create_hk_task(
             req["notes"].as_str(),
         ],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "housekeeping-task", &id, "CREATE", &req)?;
     Ok(Json(merge_json(req, &[("id", json!(id))])))
@@ -1339,7 +1536,7 @@ async fn update_hk_task(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     if let Some(status) = req["status"].as_str() {
@@ -1352,7 +1549,7 @@ async fn update_hk_task(
             "UPDATE housekeeping_task SET status = ?1, completed_at = COALESCE(?2, completed_at), local_updated_at = datetime('now') WHERE id = ?3",
             rusqlite::params![status, completed_at, id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error(e))?;
     }
 
     queue_sync(&conn, "housekeeping-task", &id, "UPDATE", &req)?;
@@ -1367,7 +1564,7 @@ async fn get_storage_quota(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let org_id = q.property_id.unwrap_or_default();
     let conn = state.db.conn().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        internal_error(e)
     })?;
 
     // Get or create quota
@@ -1426,12 +1623,12 @@ async fn serve_image(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(path): Path<String>,
 ) -> Result<Vec<u8>, (StatusCode, String)> {
-    let full_path = state.images_dir.join(&path);
-    if !full_path.exists() {
-        return Err((StatusCode::NOT_FOUND, "Image not found".to_string()));
-    }
+    let full_path = match safe_join(&state.images_dir, &path) {
+        Ok(p) => p,
+        Err(_) => return Err((StatusCode::NOT_FOUND, "Image not found".to_string())),
+    };
     std::fs::read(&full_path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|_,| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read image".to_string()))
 }
 
 // ─── Helper ───
@@ -1459,6 +1656,178 @@ fn queue_sync(
             "",
         ],
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| internal_error(e))?;
     Ok(())
+}
+
+// ─── Password hash storage (for offline auth) ───
+
+/// Store a password hash for a user so offline login can verify credentials.
+/// Called by the frontend after a successful online login.
+/// The password is hashed with SHA-256 before storage — the plaintext password
+/// is never stored.
+#[tauri::command]
+pub async fn store_password_hash(
+    email: String,
+    password: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let hash = hash_password(&password);
+    let conn = state.db.conn().map_err(|e| e.to_string())?;
+    let affected = conn.execute(
+        "UPDATE user SET password_hash = ?1 WHERE email = ?2",
+        rusqlite::params![hash, email],
+    ).map_err(|e| e.to_string())?;
+    if affected == 0 {
+        // User not found in local DB — they may not be synced yet.
+        // This is not an error; the hash will be stored after the next sync.
+        log::debug!("store_password_hash: user '{}' not found in local DB yet", email);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    // ─── hash_password / verify_password ───
+
+    #[test]
+    fn hash_password_produces_argon2_phc_format() {
+        let hash = hash_password("mysecret123");
+        assert!(
+            hash.starts_with("$argon2"),
+            "hash must be Argon2 PHC format, got: {}",
+            &hash[..20.min(hash.len())]
+        );
+    }
+
+    #[test]
+    fn hash_password_is_non_deterministic() {
+        // Argon2 uses a random salt, so two hashes of the same password differ.
+        let h1 = hash_password("mysecret123");
+        let h2 = hash_password("mysecret123");
+        assert_ne!(h1, h2, "same password must produce different hashes (random salt)");
+    }
+
+    #[test]
+    fn verify_password_succeeds_for_correct_password() {
+        let hash = hash_password("correct-horse-battery-staple");
+        assert!(verify_password("correct-horse-battery-staple", &hash), "correct password must verify");
+    }
+
+    #[test]
+    fn verify_password_fails_for_wrong_password() {
+        let hash = hash_password("correct-horse-battery-staple");
+        assert!(!verify_password("wrong-password", &hash), "wrong password must not verify");
+    }
+
+    #[test]
+    fn verify_password_supports_legacy_sha256() {
+        // Legacy SHA-256 hashes (64 hex chars) must still verify for backward compat
+        let mut hasher = Sha256::new();
+        hasher.update(b"legacy-password");
+        let legacy_hash = hex::encode(hasher.finalize());
+        assert!(verify_password("legacy-password", &legacy_hash), "legacy SHA-256 hash must verify");
+        assert!(!verify_password("wrong", &legacy_hash), "wrong password must not verify against legacy hash");
+    }
+
+    #[test]
+    fn is_legacy_hash_detects_sha256_and_argon2() {
+        let argon_hash = hash_password("test");
+        assert!(!is_legacy_hash(&argon_hash), "Argon2 hash must not be detected as legacy");
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"test");
+        let sha_hash = hex::encode(hasher.finalize());
+        assert!(is_legacy_hash(&sha_hash), "SHA-256 hash must be detected as legacy");
+    }
+
+    // ─── safe_join ───
+
+    fn create_test_base() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        // Create a file inside so canonicalize works
+        let mut f = std::fs::File::create(dir.path().join("placeholder.txt"))
+            .expect("create placeholder");
+        f.write_all(b"test").expect("write placeholder");
+        // Create a subdirectory
+        std::fs::create_dir_all(dir.path().join("guests")).expect("create subdir");
+        // Create a file in the subdir
+        let mut f2 = std::fs::File::create(dir.path().join("guests").join("img.webp"))
+            .expect("create subdir file");
+        f2.write_all(b"webp").expect("write subdir file");
+        dir
+    }
+
+    #[test]
+    fn safe_join_allows_path_within_base() {
+        let base = create_test_base();
+        let result = safe_join(base.path(), "guests/img.webp");
+        assert!(result.is_ok(), "valid path within base should be allowed");
+        let joined = result.unwrap();
+        assert!(joined.starts_with(base.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn safe_join_blocks_parent_traversal() {
+        let base = create_test_base();
+        let result = safe_join(base.path(), "../../etc/passwd");
+        assert!(result.is_err(), "path traversal with .. must be blocked");
+        let err = result.unwrap_err();
+        assert!(err.contains("traversal") || err.contains("not found"),
+            "error should mention traversal or not found, got: {}", err);
+    }
+
+    #[test]
+    fn safe_join_blocks_nonexistent_path() {
+        let base = create_test_base();
+        let result = safe_join(base.path(), "nonexistent/file.webp");
+        assert!(result.is_err(), "nonexistent path should fail canonicalize");
+    }
+
+    #[test]
+    fn safe_join_blocks_absolute_path_outside_base() {
+        let base = create_test_base();
+        // On Windows, absolute paths like C:\Windows won't be under the temp dir
+        // On Unix, /etc/hosts won't be under the temp dir
+        let outside = if cfg!(windows) { "C:/Windows/System32/drivers/etc/hosts" } else { "/etc/passwd" };
+        let result = safe_join(base.path(), outside);
+        assert!(result.is_err(), "absolute path outside base must be blocked");
+    }
+
+    // ─── merge_json ───
+
+    #[test]
+    fn merge_json_adds_new_keys() {
+        let base = json!({ "name": "Alice", "age": 30 });
+        let result = merge_json(base, &[("id", json!("uuid-123")), ("active", json!(true))]);
+        assert_eq!(result["name"], "Alice");
+        assert_eq!(result["age"], 30);
+        assert_eq!(result["id"], "uuid-123");
+        assert_eq!(result["active"], true);
+    }
+
+    #[test]
+    fn merge_json_overrides_existing_keys() {
+        let base = json!({ "name": "Alice", "version": 1 });
+        let result = merge_json(base, &[("name", json!("Bob"))]);
+        assert_eq!(result["name"], "Bob", "override should replace existing value");
+    }
+
+    #[test]
+    fn merge_json_preserves_non_object_base() {
+        let base = json!([1, 2, 3]);
+        let result = merge_json(base, &[("id", json!("x"))]);
+        // Non-object base should be returned as-is (no panic)
+        assert!(result.is_array(), "non-object base should remain unchanged");
+    }
+
+    #[test]
+    fn merge_json_with_empty_overrides() {
+        let base = json!({ "key": "value" });
+        let result = merge_json(base, &[]);
+        assert_eq!(result["key"], "value");
+    }
 }
