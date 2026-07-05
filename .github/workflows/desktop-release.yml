@@ -28,8 +28,11 @@ jobs:
       contents: write
     steps:
       # actions/checkout@v5 pinned on 2025-11-13
+      # fetch-depth: 0 — full history + tags needed for changelog generation
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
 
       # actions/setup-node@v5 pinned on 2025-09-03
       - name: Setup Node.js
@@ -77,6 +80,76 @@ jobs:
           cd src-tauri
           cargo tauri build --target "$BUILD_TARGET"
 
+      - name: Generate changelog from commits
+        id: changelog
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
+        run: |
+          TAG="desktop-v${RELEASE_VERSION}"
+          # Find the previous desktop release tag (excluding the current one)
+          git fetch --tags || true
+          PREVIOUS_TAG=$(git tag --list 'desktop-v*' --sort=-version:refname | grep -v "^${TAG}$" | head -1)
+
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "No previous desktop release tag found. Including all commits."
+            RANGE="HEAD"
+          else
+            echo "Generating changelog: ${PREVIOUS_TAG} → ${TAG}"
+            RANGE="${PREVIOUS_TAG}..HEAD"
+          fi
+
+          # Collect commits grouped by conventional-commit type
+          FEATURES=$(git log --pretty=format:'%s' "${RANGE}" 2>/dev/null | grep -iE '^(feat|feature)(\(|:)' | sed 's/^[^:]*: *//' | sed 's/^/- /' || true)
+          FIXES=$(git log --pretty=format:'%s' "${RANGE}" 2>/dev/null | grep -iE '^fix(\(|:)' | sed 's/^[^:]*: *//' | sed 's/^/- /' || true)
+          REFACTORS=$(git log --pretty=format:'%s' "${RANGE}" 2>/dev/null | grep -iE '^(refactor|perf)(\(|:)' | sed 's/^[^:]*: *//' | sed 's/^/- /' || true)
+          CHORES=$(git log --pretty=format:'%s' "${RANGE}" 2>/dev/null | grep -iE '^(chore|ci|build|docs|style|test)(\(|:)' | sed 's/^[^:]*: *//' | sed 's/^/- /' || true)
+
+          # Build the markdown changelog
+          {
+            if [ -n "$FEATURES" ]; then
+              echo "## New Features"
+              echo ""
+              echo "$FEATURES"
+              echo ""
+            fi
+            if [ -n "$FIXES" ]; then
+              echo "## Bug Fixes"
+              echo ""
+              echo "$FIXES"
+              echo ""
+            fi
+            if [ -n "$REFACTORS" ]; then
+              echo "## Improvements"
+              echo ""
+              echo "$REFACTORS"
+              echo ""
+            fi
+            if [ -n "$CHORES" ]; then
+              echo "## Maintenance"
+              echo ""
+              echo "$CHORES"
+              echo ""
+            fi
+
+            # If no categorized commits, show a fallback
+            if [ -z "$FEATURES" ] && [ -z "$FIXES" ] && [ -z "$REFACTORS" ] && [ -z "$CHORES" ]; then
+              echo "No notable changes in this release."
+              echo ""
+            fi
+
+            echo "---"
+            if [ -n "$PREVIOUS_TAG" ]; then
+              echo "**Full changelog:** https://github.com/${GITHUB_REPOSITORY}/compare/${PREVIOUS_TAG}...${TAG}"
+            else
+              echo "Initial desktop release."
+            fi
+          } > changelog.md
+
+          echo "=== Generated changelog ==="
+          cat changelog.md
+          echo "=== End changelog ==="
+
       - name: Create tag and release
         shell: bash
         env:
@@ -88,7 +161,7 @@ jobs:
           git push origin "$TAG" || true
           gh release create "$TAG" \
             --title "ViharaOS Desktop v${RELEASE_VERSION}" \
-            --notes "Desktop release v${RELEASE_VERSION}" \
+            --notes-file changelog.md \
             --verify-tag || true
 
       - name: Upload Windows installers and updater artifacts
