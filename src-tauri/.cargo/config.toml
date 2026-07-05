@@ -1,0 +1,19 @@
+# Increase the main thread stack size from Windows' default 1MB to 8MB.
+#
+# Tauri's `generate_context!()` macro creates a large number of runtime
+# structures from tauri.conf.json (CSP, window config, plugin config, bundle
+# config, updater config, etc.) on the stack before moving them to the heap.
+# With 7 plugins and 20 invoke handlers, the stack usage can exceed Windows'
+# 1MB default, causing STATUS_STACK_BUFFER_OVERRUN (0xc0000409) on startup.
+#
+# This is a known Tauri issue: https://github.com/tauri-apps/tauri/issues/9882
+# The recommended fix is to increase the stack size via linker args.
+#
+# Linux and macOS use a much larger default stack (8MB), so this is only
+# needed for Windows targets.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

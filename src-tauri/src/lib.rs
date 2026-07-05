@@ -244,6 +244,17 @@ pub fn run() {
             commands::conflicts::resolve_conflict_manual,
             commands::api::store_password_hash,
         ])
-        .run(tauri::generate_context!())
+        // Run generate_context!() in a separate thread with a larger stack
+        // (8MB) to avoid stack overflow on Windows where the main thread
+        // defaults to 1MB. See .cargo/config.toml for the linker-level fix
+        // and https://github.com/tauri-apps/tauri/issues/9882 for context.
+        .run(
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn(|| tauri::generate_context!())
+                .unwrap()
+                .join()
+                .unwrap(),
+        )
         .expect("error while running ViharaOS desktop");
 }
