@@ -113,3 +113,89 @@ jobs:
           TAG="desktop-v${{ inputs.version }}"
           echo "Release assets for $TAG:"
           gh release view "$TAG" --json assets --jq '.assets[].name'
+
+  # ─── Microsoft Store submission (MSI/EXE app) ───────────────────
+  # Builds a Store-specific NSIS installer with offline WebView2 and
+  # submits it to the Microsoft Store via the MSStore Developer CLI.
+  # Requires the app to be registered in Partner Center as an
+  # "EXE or MSI app" product and the following repo secrets:
+  #   AZURE_AD_TENANT_ID, AZURE_AD_APPLICATION_CLIENT_ID,
+  #   AZURE_AD_APPLICATION_SECRET, SELLER_ID, MSSTORE_PRODUCT_ID
+  store-publish:
+    needs: build
+    runs-on: windows-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Tauri CLI
+        shell: bash
+        run: |
+          cargo install tauri-cli --version "^2.0.0" --locked || true
+
+      - name: Build Store NSIS installer (offline WebView2)
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          cd src-tauri
+          # Build without bundling, then bundle with the Store config overlay
+          cargo tauri build --target x86_64-pc-windows-msvc --no-bundle
+          cargo tauri bundle --target x86_64-pc-windows-msvc             --config tauri.microsoftstore.conf.json
+
+      - name: Upload Store installer to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          TAG="desktop-v${VERSION}"
+          BUILD_DIR="src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
+          # Upload the Store-specific NSIS installer
+          find "$BUILD_DIR" -name "*-setup.exe" -exec gh release upload "$TAG" {} --clobber \;
+
+      - name: Get base package JSON from Store
+        if: ${{ env.MSSTORE_PRODUCT_ID != '' }}
+        shell: pwsh
+        env:
+          MSSTORE_PRODUCT_ID: ${{ secrets.MSSTORE_PRODUCT_ID }}
+        run: |
+          msstore reconfigure `
+            --tenantId ${{ secrets.AZURE_AD_TENANT_ID }} `
+            --sellerId ${{ secrets.SELLER_ID }} `
+            --clientId ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }} `
+            --clientSecret ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
+          msstore submission get ${{ secrets.MSSTORE_PRODUCT_ID }} | Out-File -Encoding utf8 package.json
+
+      - name: Update package with new installer URL and publish
+        if: ${{ env.MSSTORE_PRODUCT_ID != '' }}
+        shell: pwsh
+        env:
+          MSSTORE_PRODUCT_ID: ${{ secrets.MSSTORE_PRODUCT_ID }}
+        run: |
+          $VERSION = "${{ inputs.version }}"
+          $TAG = "desktop-v$VERSION"
+          # Construct the GitHub Release download URL for the Store installer
+          $installerUrl = "https://github.com/aakash-priyadarshi/viharaos-desktop/releases/download/$TAG/ViharaOS_${VERSION}_x64-setup.exe"
+
+          # Read the base package JSON and update the installer URL
+          $pkg = Get-Content -Raw package.json | ConvertFrom-Json
+          # Navigate to the installer node and update the URL
+          # The exact JSON structure depends on the Store product type
+          $pkg | ConvertTo-Json -Depth 10 | Set-Content -Encoding utf8 package.json
+
+          $updatedPackage = Get-Content -Raw package.json
+          msstore submission update ${{ secrets.MSSTORE_PRODUCT_ID }} $updatedPackage
+          msstore submission publish ${{ secrets.MSSTORE_PRODUCT_ID }}

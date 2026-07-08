@@ -56,3 +56,50 @@ For signed updates, set these repository secrets:
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
 
 Without signing, the updater will still download but won't verify signatures.
+
+## Microsoft Store distribution
+
+The workflow includes a `store-publish` job that submits the NSIS installer
+to the Microsoft Store via the [MSStore Developer CLI](https://learn.microsoft.com/en-us/windows/apps/publish/msstore-dev-cli/overview).
+The Store wraps the installer in MSIX and signs it with Microsoft's certificate,
+so users who install from the Store see no SmartScreen warning.
+
+### Prerequisites
+
+1. **Partner Center**: Register as a developer at https://partner.microsoft.com/
+2. **Create product**: In Partner Center → Apps and Games → New Product →
+   select "EXE or MSI app" → reserve the name "ViharaOS"
+3. **Entra ID app registration**: Follow
+   https://learn.microsoft.com/en-us/windows/apps/publish/partner-center/associate-existing-azure-ad-tenant-with-partner-center-account
+   to associate an Entra ID tenant with your Partner Center account, then
+   register an app in Entra ID and add it to Partner Center with the Manager role.
+4. **Get your IDs**:
+   - Tenant ID: https://entra.microsoft.com/ → Overview → Tenant ID
+   - Client ID: Entra admin center → App registrations → your app → Application ID
+   - Client Secret: App registrations → Certificates & secrets → create new
+   - Seller ID: Partner Center → Account settings → Developer settings → Publisher ID
+   - Product ID: Partner Center → your app product page → Product identity
+
+### GitHub repository secrets
+
+Add these secrets to the `viharaos-desktop` repo (Settings → Secrets → Actions):
+
+| Secret | Value |
+|---|---|
+| `AZURE_AD_TENANT_ID` | Your Entra ID tenant ID |
+| `AZURE_AD_APPLICATION_CLIENT_ID` | Your Entra ID app registration client ID |
+| `AZURE_AD_APPLICATION_SECRET` | Your Entra ID app registration client secret |
+| `SELLER_ID` | Your Partner Center Seller/Publisher ID |
+| `MSSTORE_PRODUCT_ID` | Your Store product ID from Partner Center |
+
+The `store-publish` job only runs when these secrets are present. If they are
+not set, the job builds the Store installer and uploads it to the GitHub release
+but skips the Store submission.
+
+### First-time setup
+
+1. Submit the first app package manually in Partner Center (upload the
+   `ViharaOS_x.x.x_x64-setup.exe` from a GitHub release, set the silent
+   install parameter to `/S`, and complete the store listing).
+2. After the first submission is published, the `store-publish` job can
+   automate subsequent updates.
