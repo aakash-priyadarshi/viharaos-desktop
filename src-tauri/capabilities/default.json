@@ -9,6 +9,7 @@
     "process:default",
     "notification:default",
     "store:default",
-    "dialog:default"
+    "dialog:default",
+    "deep-link:default"
   ]
 }

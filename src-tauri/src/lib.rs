@@ -1,11 +1,13 @@
 mod commands;
 mod db;
 mod image;
+mod menu;
 mod r2;
 mod sync;
 
 use std::sync::Arc;
 use tauri::Manager;
+use tauri_plugin_deep_link::DeepLinkExt;
 
 use db::Database;
 use sync::SyncEngine;
@@ -129,7 +131,14 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
-        .plugin(tauri_plugin_dialog::init());
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_deep_link::init())
+        // Dispatch custom menu item clicks to the handler.
+        // Predefined items (About/Quit/Undo/Cut/Copy/Paste/Minimize/Close)
+        // are handled by the OS and never reach this closure.
+        .on_menu_event(|app, event| {
+            menu::handle_menu_event(app, event.id().as_ref());
+        });
 
     #[cfg(feature = "e2e-testing")]
     {
@@ -219,6 +228,39 @@ pub fn run() {
             });
 
             app.manage(state);
+
+            // Build and install the platform-adaptive native menu bar.
+            // On macOS the first submenu becomes the app menu; on Windows
+            // all submenus appear as top-level menu bar entries.
+            let menu_handle = app.handle().clone();
+            match menu::build_menu(&menu_handle) {
+                Ok(menu) => {
+                    if let Err(e) = app.set_menu(menu) {
+                        log::warn!("Failed to set menu bar: {}", e);
+                    } else {
+                        log::info!("Native menu bar installed");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to build menu bar: {}", e);
+                }
+            }
+
+            // Handle deep links (viharaos://) — focus the window when a link is received.
+            // This is used by the browser login flow: after the user authorizes in the
+            // browser, the page redirects to viharaos://auth?device_code=XXX, which
+            // brings the desktop app to the foreground so the user sees the login complete.
+            // The viharaos:// scheme is registered in tauri.conf.json under
+            // plugins.deep-link.desktop.schemes / mobile.schemes.
+            let deep_link_app = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                log::info!("Deep link received ({} URLs)", event.urls().len());
+                if let Some(window) = deep_link_app.get_webview_window("main") {
+                    let _ = window.set_focus();
+                    let _ = window.unminimize();
+                }
+            });
+
             log::info!("ViharaOS Desktop setup complete");
             Ok(())
         })
@@ -243,6 +285,7 @@ pub fn run() {
             commands::conflicts::resolve_conflict_accept_server,
             commands::conflicts::resolve_conflict_manual,
             commands::api::store_password_hash,
+            commands::auth::login_with_browser,
         ])
         // Run generate_context!() in a separate thread with a larger stack
         // (8MB) to avoid stack overflow on Windows where the main thread

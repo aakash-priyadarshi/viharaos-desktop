@@ -1,6 +1,6 @@
 [package]
 name = "viharaos-desktop"
-version = "0.1.6"
+version = "0.2.0"
 description = "ViharaOS Desktop — Offline-first Tauri shell"
 authors = ["ViharaOS"]
 edition = "2021"
@@ -22,6 +22,7 @@ tauri-plugin-http = "2.0.0"
 tauri-plugin-notification = "2.0.0"
 tauri-plugin-store = "2.0.0"
 tauri-plugin-dialog = "2.0.0"
+tauri-plugin-deep-link = "2.4"
 tauri-plugin-playwright = { version = "0.4", optional = true }
 
 # Local API server (embedded HTTP server mimicking NestJS API)
@@ -67,6 +68,9 @@ notify = "6.1"
 # Password hashing (Argon2id — replaces insecure SHA-256 for offline auth)
 argon2 = "0.5"
 rand = "0.8"
+
+# Open URLs in the system browser (for device authorization flow)
+open = "5"
 
 # Pin ctor to avoid 0.8.0 which has a missing ctor_proc_macro crate issue
 ctor = "0.2"
