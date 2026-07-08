@@ -52,6 +52,10 @@ jobs:
           choco install gh -y || true
           echo "C:\\Program Files\\GitHub CLI" >> $GITHUB_PATH
 
+      - name: Setup WinApp CLI (Windows)
+        if: runner.os == 'Windows'
+        uses: microsoft/setup-WinAppCli@v0.1
+
       - name: Build Tauri app
         shell: bash
         env:
@@ -60,6 +64,15 @@ jobs:
         run: |
           cd src-tauri
           cargo tauri build --target ${{ matrix.target }}
+
+      - name: Build Windows MSIX package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          ./scripts/build-msix.ps1 -Version "${{ inputs.version }}"
 
       - name: Create tag and release
         shell: bash
@@ -85,6 +98,8 @@ jobs:
           TAG="desktop-v${VERSION}"
           BUILD_DIR="src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
           find "$BUILD_DIR" -name "*.msi" -exec gh release upload "$TAG" {} --clobber \;
+          find "$BUILD_DIR" -name "*.msix" -exec gh release upload "$TAG" {} --clobber \;
+          find "$BUILD_DIR" -name "*.cer" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "latest.json" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "*.sig" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "*-setup.exe" -exec gh release upload "$TAG" {} --clobber \;
