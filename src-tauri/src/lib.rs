@@ -273,6 +273,7 @@ pub fn run() {
             commands::sync::trigger_sync,
             commands::sync::get_sync_status,
             commands::sync::set_sync_enabled,
+            commands::updater::get_app_info,
             commands::updater::check_for_updates,
             commands::updater::download_and_install_update,
             commands::heartbeat::get_device_heartbeat,

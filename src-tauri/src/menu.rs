@@ -1,39 +1,51 @@
-use tauri::menu::{AboutMetadata, Menu, MenuBuilder, MenuItem, SubmenuBuilder};
+use tauri::menu::{Menu, MenuBuilder, MenuItem, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 /// Build the platform-adaptive native menu bar.
 ///
 /// On macOS the first submenu becomes the application menu (named "ViharaOS")
-/// and gets the standard About/Quit items placed there by the OS.
-/// On Windows/Linux every submenu appears as a top-level menu bar entry.
+/// and gets app-level About/Update/Quit items. On Windows/Linux, About lives
+/// in Help and File contains app actions such as updates and quit.
 pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
-    // ─── App / File menu ───
-    // On macOS this is the app menu ("ViharaOS"); on Windows it's "File".
     let app_menu_label = if cfg!(target_os = "macos") {
         "ViharaOS"
     } else {
         "&File"
     };
 
-    let app_menu = SubmenuBuilder::new(app, app_menu_label)
-        .about(Some(AboutMetadata {
-            name: Some("ViharaOS".to_string()),
-            version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            ..Default::default()
-        }))
-        .separator()
-        .item(&MenuItem::with_id(
-            app,
-            "check-updates",
-            "Check for Updates…",
-            true,
-            None::<&str>,
-        )?)
-        .separator()
-        .quit()
-        .build()?;
+    let app_menu = if cfg!(target_os = "macos") {
+        SubmenuBuilder::new(app, app_menu_label)
+            .item(&MenuItem::with_id(
+                app,
+                "about-viharaos",
+                "About ViharaOS",
+                true,
+                None::<&str>,
+            )?)
+            .item(&MenuItem::with_id(
+                app,
+                "check-updates",
+                "Check for Updates...",
+                true,
+                None::<&str>,
+            )?)
+            .separator()
+            .quit()
+            .build()?
+    } else {
+        SubmenuBuilder::new(app, app_menu_label)
+            .item(&MenuItem::with_id(
+                app,
+                "check-updates",
+                "Check for Updates...",
+                true,
+                None::<&str>,
+            )?)
+            .separator()
+            .quit()
+            .build()?
+    };
 
-    // ─── Edit menu ───
     let edit_menu = SubmenuBuilder::new(app, "&Edit")
         .undo()
         .redo()
@@ -44,9 +56,14 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .select_all()
         .build()?;
 
-    // ─── View menu ───
     let view_menu = SubmenuBuilder::new(app, "&View")
-        .item(&MenuItem::with_id(app, "reload", "Reload", true, Some("F5"))?)
+        .item(&MenuItem::with_id(
+            app,
+            "reload",
+            "Reload",
+            true,
+            Some("F5"),
+        )?)
         .item(&MenuItem::with_id(
             app,
             "toggle-devtools",
@@ -64,7 +81,6 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         )?)
         .build()?;
 
-    // ─── Sync menu (ViharaOS-specific) ───
     let sync_menu = SubmenuBuilder::new(app, "&Sync")
         .item(&MenuItem::with_id(
             app,
@@ -82,32 +98,56 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         )?)
         .build()?;
 
-    // ─── Window menu ───
     let window_menu = SubmenuBuilder::new(app, "&Window")
         .minimize()
         .separator()
         .close_window()
         .build()?;
 
-    // ─── Help menu ───
-    let help_menu = SubmenuBuilder::new(app, "&Help")
-        .item(&MenuItem::with_id(
-            app,
-            "website",
-            "ViharaOS Website",
-            true,
-            None::<&str>,
-        )?)
-        .item(&MenuItem::with_id(
-            app,
-            "report-issue",
-            "Report an Issue",
-            true,
-            None::<&str>,
-        )?)
-        .build()?;
+    let help_menu = if cfg!(target_os = "macos") {
+        SubmenuBuilder::new(app, "&Help")
+            .item(&MenuItem::with_id(
+                app,
+                "website",
+                "ViharaOS Website",
+                true,
+                None::<&str>,
+            )?)
+            .item(&MenuItem::with_id(
+                app,
+                "report-issue",
+                "Report an Issue",
+                true,
+                None::<&str>,
+            )?)
+            .build()?
+    } else {
+        SubmenuBuilder::new(app, "&Help")
+            .item(&MenuItem::with_id(
+                app,
+                "about-viharaos",
+                "About ViharaOS",
+                true,
+                None::<&str>,
+            )?)
+            .separator()
+            .item(&MenuItem::with_id(
+                app,
+                "website",
+                "ViharaOS Website",
+                true,
+                None::<&str>,
+            )?)
+            .item(&MenuItem::with_id(
+                app,
+                "report-issue",
+                "Report an Issue",
+                true,
+                None::<&str>,
+            )?)
+            .build()?
+    };
 
-    // Assemble the menu bar from all submenus.
     MenuBuilder::new(app)
         .item(&app_menu)
         .item(&edit_menu)
@@ -119,14 +159,8 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 }
 
 /// Handle a custom menu item click.
-///
-/// Predefined items (About, Quit, Undo, Redo, Cut, Copy, Paste, Select All,
-/// Minimize, Close Window) are handled by the OS/Tauri automatically and
-/// never reach this handler. Only items created with `MenuItem::with_id`
-/// are dispatched here.
 pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
     match id {
-        // ─── View ───
         "reload" => {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.eval("window.location.reload()");
@@ -143,8 +177,6 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
         }
         "toggle-dark-mode" => {
             if let Some(window) = app.get_webview_window("main") {
-                // Toggle the `dark` class on <html> and persist to localStorage.
-                // This mirrors the manual toggle in the dashboard sidebar.
                 let _ = window.eval(
                     "(function(){\
                        var d=document.documentElement.classList;\
@@ -154,8 +186,11 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
                 );
             }
         }
-
-        // ─── App-specific (emit to frontend) ───
+        "about-viharaos" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("menu-action", "about-viharaos");
+            }
+        }
         "check-updates" => {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("menu-action", "check-updates");
@@ -166,13 +201,9 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
                 let _ = window.emit("menu-action", "sync-now");
             }
         }
-
-        // ─── Open external resources ───
         "open-logs" => {
             if let Some(state) = app.try_state::<std::sync::Arc<crate::AppState>>() {
                 let log_dir = state.app_data_dir.clone();
-                // Open the folder in the OS file explorer.
-                // If it fails on some platforms, try opening the parent.
                 if let Err(e) = open::that(&log_dir) {
                     log::warn!("Failed to open logs folder: {}", e);
                 }
@@ -188,7 +219,6 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
                 log::warn!("Failed to open mail client: {}", e);
             }
         }
-
         _ => {
             log::debug!("Unhandled menu event: {}", id);
         }

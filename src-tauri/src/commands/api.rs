@@ -17,6 +17,7 @@ use argon2::{
 };
 
 use crate::AppState;
+use crate::commands::auth::{CloudUser, get_server_url, store_cloud_session};
 use crate::db::models::*;
 
 /// Hash a password with Argon2id for offline verification.
@@ -220,7 +221,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sync/status", get(get_sync_status))
         .route("/api/sync/trigger", post(trigger_sync))
         // Static image serving (local filesystem)
-        .route("/images/{*path}", get(serve_image))
+        .route("/images/*path", get(serve_image))
         .with_state(state)
         // Auth middleware: validates Bearer token against session_token table
         // for all routes except /api/health and /api/auth/login.
@@ -249,15 +250,130 @@ async fn health() -> Json<Value> {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LoginRequest {
     email: String,
     password: String,
+    #[serde(default)]
+    totp: Option<String>,
+    #[serde(default)]
+    turnstile_token: Option<String>,
+    #[serde(default)]
+    remember_me: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudLoginResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    user: Option<CloudUser>,
+    #[serde(default)]
+    two_factor_required: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+async fn try_cloud_login(
+    state: &AppState,
+    req: &LoginRequest,
+) -> Result<Option<Json<Value>>, (StatusCode, String)> {
+    let server_url = get_server_url(state);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create HTTP client: {}", e)))?;
+
+    let mut body = serde_json::Map::new();
+    body.insert("email".to_string(), json!(&req.email));
+    body.insert("password".to_string(), json!(&req.password));
+    body.insert("rememberMe".to_string(), json!(req.remember_me.unwrap_or(false)));
+    if let Some(totp) = &req.totp {
+        body.insert("totp".to_string(), json!(totp));
+    }
+    if let Some(turnstile_token) = &req.turnstile_token {
+        body.insert("turnstileToken".to_string(), json!(turnstile_token));
+    }
+
+    let response = match client
+        .post(format!("{}/auth/login", server_url))
+        .json(&Value::Object(body))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            log::warn!("Cloud login unavailable, falling back to offline auth: {}", e);
+            return Ok(None);
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let axum_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Err((axum_status, body));
+    }
+
+    let cloud: CloudLoginResponse = response
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Cloud login response was invalid: {}", e)))?;
+
+    if cloud.two_factor_required.unwrap_or(false) {
+        return Ok(Some(Json(json!({ "twoFactorRequired": true }))));
+    }
+
+    let access_token = cloud
+        .access_token
+        .ok_or((StatusCode::BAD_GATEWAY, "Cloud login response missing access token".to_string()))?;
+    let refresh_token = cloud
+        .refresh_token
+        .ok_or((StatusCode::BAD_GATEWAY, "Cloud login response missing refresh token".to_string()))?;
+    let user = cloud
+        .user
+        .ok_or((StatusCode::BAD_GATEWAY, "Cloud login response missing user".to_string()))?;
+    let remember_me = req.remember_me.unwrap_or(false);
+
+    let session_token = store_cloud_session(
+        state,
+        &user,
+        &access_token,
+        &refresh_token,
+        remember_me,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let conn = state
+        .db
+        .conn()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let password_hash = hash_password(&req.password);
+    let _ = conn.execute(
+        "UPDATE user SET password_hash = ?1 WHERE id = ?2",
+        rusqlite::params![password_hash, &user.id],
+    );
+
+    Ok(Some(Json(json!({
+        "accessToken": session_token.clone(),
+        "refreshToken": session_token,
+        "rememberMe": remember_me,
+        "user": user,
+    }))))
 }
 
 async fn auth_login(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    if let Some(cloud_result) = try_cloud_login(&state, &req).await? {
+        return Ok(cloud_result);
+    }
+
     let conn = state.db.conn().map_err(|_| {
         (StatusCode::INTERNAL_SERVER_ERROR, "Database unavailable".to_string())
     })?;
@@ -266,7 +382,7 @@ async fn auth_login(
         .query_row(
             "SELECT id, email, name, role, organization_id, property_id, password_hash
              FROM user WHERE email = ?1 AND is_active = 1",
-            rusqlite::params![req.email],
+            rusqlite::params![&req.email],
             |row| Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -296,7 +412,7 @@ async fn auth_login(
                     let new_hash = hash_password(&req.password);
                     let _ = conn.execute(
                         "UPDATE user SET password_hash = ?1 WHERE id = ?2",
-                        rusqlite::params![new_hash, id],
+                        rusqlite::params![new_hash, &id],
                     );
                     log::info!("Upgraded password hash from SHA-256 to Argon2id for user '{}'", email);
                 }
@@ -311,14 +427,15 @@ async fn auth_login(
             // Update last_login_at
             let _ = conn.execute(
                 "UPDATE user SET last_login_at = datetime('now') WHERE id = ?1",
-                rusqlite::params![id],
+                rusqlite::params![&id],
             );
 
             // Generate a session token and store it for API auth
             let token = format!("offline-token-{}", uuid::Uuid::new_v4());
+            let session_ttl = if req.remember_me.unwrap_or(false) { "+15 days" } else { "+7 days" };
             let _ = conn.execute(
-                "INSERT INTO session_token (token, user_id) VALUES (?1, ?2)",
-                rusqlite::params![token, id],
+                "INSERT INTO session_token (token, user_id, expires_at) VALUES (?1, ?2, datetime('now', ?3))",
+                rusqlite::params![&token, &id, session_ttl],
             );
             // Clean up expired tokens
             let _ = conn.execute(
@@ -327,7 +444,9 @@ async fn auth_login(
             );
 
             Ok(Json(json!({
-                "accessToken": token,
+                "accessToken": token.clone(),
+                "refreshToken": token,
+                "rememberMe": req.remember_me.unwrap_or(false),
                 "user": {
                     "id": id,
                     "email": email,
@@ -335,6 +454,9 @@ async fn auth_login(
                     "role": role,
                     "organizationId": org_id,
                     "propertyId": prop_id,
+                    "isPlatformAdmin": false,
+                    "canManageStaff": false,
+                    "managedHotelIds": [],
                 }
             })))
         }
@@ -371,18 +493,59 @@ async fn auth_me(
                 "role": row.get::<_, String>(3)?,
                 "organizationId": row.get::<_, Option<String>>(4)?,
                 "propertyId": row.get::<_, Option<String>>(5)?,
+                "isPlatformAdmin": false,
+                "canManageStaff": false,
+                "managedHotelIds": [],
             })),
         )
         .ok();
 
     match user {
-        Some(u) => Ok(Json(json!({ "user": u }))),
+        Some(u) => Ok(Json(u)),
         None => Err((StatusCode::UNAUTHORIZED, "Not authenticated".to_string())),
     }
 }
 
-async fn auth_refresh() -> Json<Value> {
-    Json(json!({ "accessToken": "offline-token-refreshed" }))
+async fn auth_refresh(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(req): Json<RefreshRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let conn = state.db.conn().map_err(|e| {
+        internal_error(e)
+    })?;
+
+    let user_id: Option<String> = conn
+        .query_row(
+            "SELECT user_id FROM session_token
+             WHERE token = ?1 AND expires_at > datetime('now')
+             UNION
+             SELECT id FROM user
+             WHERE refresh_token = ?1
+               AND is_active = 1
+               AND (token_expires_at IS NULL OR token_expires_at > datetime('now'))
+             LIMIT 1",
+            rusqlite::params![&req.refresh_token],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let Some(user_id) = user_id else {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid refresh token".to_string()));
+    };
+
+    let token = format!("offline-token-{}", uuid::Uuid::new_v4());
+    conn.execute(
+        "INSERT INTO session_token (token, user_id, expires_at) VALUES (?1, ?2, datetime('now', '+15 days'))",
+        rusqlite::params![&token, user_id],
+    )
+    .map_err(|e| internal_error(e))?;
+
+    let _ = conn.execute(
+        "DELETE FROM session_token WHERE expires_at < datetime('now')",
+        [],
+    );
+
+    Ok(Json(json!({ "accessToken": token.clone(), "refreshToken": token })))
 }
 
 // ─── Guests ───

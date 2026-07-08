@@ -1,9 +1,10 @@
-use std::sync::Arc;
-use serde::{Deserialize, Serialize};
 use crate::AppState;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Response from POST /auth/device/code (cloud API)
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DeviceCodeResponse {
     device_code: String,
     user_code: String,
@@ -14,6 +15,7 @@ struct DeviceCodeResponse {
 
 /// Response from POST /auth/device/token (cloud API) on success
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DeviceTokenResponse {
     access_token: String,
     refresh_token: String,
@@ -23,6 +25,7 @@ struct DeviceTokenResponse {
 
 /// User object returned by the cloud API
 #[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct CloudUser {
     pub id: String,
     pub email: String,
@@ -37,6 +40,7 @@ pub struct CloudUser {
 
 /// Result returned to the frontend after successful browser login
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BrowserLoginResult {
     pub access_token: String,
     pub refresh_token: String,
@@ -45,6 +49,7 @@ pub struct BrowserLoginResult {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BrowserLoginUser {
     pub id: String,
     pub email: String,
@@ -75,7 +80,7 @@ impl From<CloudUser> for BrowserLoginUser {
 
 /// Get the cloud API server URL from sync_settings.
 /// Falls back to the production API URL if not configured.
-fn get_server_url(state: &AppState) -> String {
+pub(crate) fn get_server_url(state: &AppState) -> String {
     if let Ok(conn) = state.db.conn() {
         if let Ok(url) = conn.query_row(
             "SELECT value FROM sync_settings WHERE key = 'server_url'",
@@ -93,7 +98,7 @@ fn get_server_url(state: &AppState) -> String {
 
 /// Store cloud JWT tokens and user data in the local database.
 /// Also creates a local session token for the embedded API server.
-fn store_cloud_session(
+pub(crate) fn store_cloud_session(
     state: &AppState,
     user: &CloudUser,
     access_token: &str,
@@ -101,34 +106,35 @@ fn store_cloud_session(
     remember_me: bool,
 ) -> Result<String, String> {
     let conn = state.db.conn().map_err(|e| e.to_string())?;
+    let session_ttl = if remember_me { "+15 days" } else { "+7 days" };
 
     // Upsert the user in the local user table
     conn.execute(
         "INSERT INTO user (id, email, name, role, is_active, organization_id, property_id, auth_token, refresh_token, token_expires_at)
-         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, datetime('now', '+15 days'))
+         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, datetime('now', ?9))
          ON CONFLICT(id) DO UPDATE SET
            email = ?2, name = ?3, role = ?4, organization_id = ?5, property_id = ?6,
            auth_token = ?7, refresh_token = ?8,
            token_expires_at = datetime('now', ?9),
            last_login_at = datetime('now')",
         rusqlite::params![
-            user.id,
-            user.email,
-            user.name,
-            user.role,
-            user.organization_id,
-            user.property_id,
+            &user.id,
+            &user.email,
+            &user.name,
+            &user.role,
+            &user.organization_id,
+            &user.property_id,
             access_token,
             refresh_token,
-            if remember_me { "+15 days" } else { "+7 days" },
+            session_ttl,
         ],
     ).map_err(|e| e.to_string())?;
 
     // Generate a local session token for the embedded API server
     let session_token = format!("browser-{}", uuid::Uuid::new_v4());
     conn.execute(
-        "INSERT INTO session_token (token, user_id) VALUES (?1, ?2)",
-        rusqlite::params![session_token, user.id],
+        "INSERT INTO session_token (token, user_id, expires_at) VALUES (?1, ?2, datetime('now', ?3))",
+        rusqlite::params![&session_token, &user.id, session_ttl],
     ).map_err(|e| e.to_string())?;
 
     // Clean up expired tokens
@@ -157,6 +163,7 @@ fn store_cloud_session(
 #[tauri::command]
 pub async fn login_with_browser(
     state: tauri::State<'_, Arc<AppState>>,
+    provider_hint: Option<String>,
 ) -> Result<BrowserLoginResult, String> {
     let server_url = get_server_url(&state);
     let client = reqwest::Client::builder()
@@ -183,14 +190,24 @@ pub async fn login_with_browser(
         .await
         .map_err(|e| format!("Failed to parse device code response: {}", e))?;
 
+    let mut verification_url = device_code.verification_url.clone();
+    if provider_hint.as_deref() == Some("google") {
+        let separator = if verification_url.contains('?') {
+            "&"
+        } else {
+            "?"
+        };
+        verification_url = format!("{}{}provider=google", verification_url, separator);
+    }
+
     log::info!(
         "Browser login: device code created, user_code={}, verification_url={}",
         device_code.user_code,
-        device_code.verification_url
+        verification_url
     );
 
     // Step 2: Open the verification URL in the system browser
-    if let Err(e) = open::that(&device_code.verification_url) {
+    if let Err(e) = open::that(&verification_url) {
         log::error!("Failed to open browser: {}", e);
         return Err(format!("Failed to open browser: {}", e));
     }
@@ -230,20 +247,21 @@ pub async fn login_with_browser(
                     );
 
                     // Step 4: Store tokens + user data locally
-                    let _session_token = store_cloud_session(
+                    let session_token = store_cloud_session(
                         &state,
                         &token_resp.user,
                         &token_resp.access_token,
                         &token_resp.refresh_token,
                         token_resp.remember_me,
-                    ).map_err(|e| {
+                    )
+                    .map_err(|e| {
                         log::error!("Failed to store cloud session: {}", e);
                         e
                     })?;
 
                     return Ok(BrowserLoginResult {
-                        access_token: token_resp.access_token,
-                        refresh_token: token_resp.refresh_token,
+                        access_token: session_token.clone(),
+                        refresh_token: session_token,
                         user: token_resp.user.into(),
                         remember_me: token_resp.remember_me,
                     });
@@ -251,7 +269,11 @@ pub async fn login_with_browser(
                     // authorization_pending — keep polling
                     let body = r.text().await.unwrap_or_default();
                     if body.contains("authorization_pending") {
-                        log::debug!("Browser login: still pending (poll {}/{})", i + 1, max_polls);
+                        log::debug!(
+                            "Browser login: still pending (poll {}/{})",
+                            i + 1,
+                            max_polls
+                        );
                         continue;
                     }
                     // Other 400 errors (access_denied, etc.)
@@ -274,7 +296,10 @@ pub async fn login_with_browser(
         }
     }
 
-    Err(format!("Browser login timed out after {} polls. {}", max_polls, last_error))
+    Err(format!(
+        "Browser login timed out after {} polls. {}",
+        max_polls, last_error
+    ))
 }
 
 #[cfg(test)]
