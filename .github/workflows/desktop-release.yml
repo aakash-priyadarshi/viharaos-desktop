@@ -221,22 +221,23 @@ jobs:
       contents: read
     env:
       MSSTORE_PRODUCT_ID: 9P534ZMK75XC
+      STORE_PUBLISH: ${{ secrets.AZURE_AD_TENANT_ID != '' && secrets.AZURE_AD_APPLICATION_CLIENT_ID != '' && secrets.AZURE_AD_APPLICATION_SECRET != '' && secrets.SELLER_ID != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup .NET 9 (MSStore CLI requires it)
-        if: secrets.AZURE_AD_TENANT_ID != '' && secrets.AZURE_AD_APPLICATION_CLIENT_ID != '' && secrets.AZURE_AD_APPLICATION_SECRET != '' && secrets.SELLER_ID != ''
+        if: env.STORE_PUBLISH == 'true'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '9.x'
 
       - name: Setup Microsoft Store CLI
-        if: secrets.AZURE_AD_TENANT_ID != '' && secrets.AZURE_AD_APPLICATION_CLIENT_ID != '' && secrets.AZURE_AD_APPLICATION_SECRET != '' && secrets.SELLER_ID != ''
+        if: env.STORE_PUBLISH == 'true'
         uses: microsoft/microsoft-store-apppublisher@v1.2
 
       - name: Download MSIX from release
-        if: secrets.AZURE_AD_TENANT_ID != '' && secrets.AZURE_AD_APPLICATION_CLIENT_ID != '' && secrets.AZURE_AD_APPLICATION_SECRET != '' && secrets.SELLER_ID != ''
+        if: env.STORE_PUBLISH == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -253,7 +254,7 @@ jobs:
           "MSIX_PATH=release/$AssetName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Reconfigure Microsoft Store credentials
-        if: secrets.AZURE_AD_TENANT_ID != '' && secrets.AZURE_AD_APPLICATION_CLIENT_ID != '' && secrets.AZURE_AD_APPLICATION_SECRET != '' && secrets.SELLER_ID != ''
+        if: env.STORE_PUBLISH == 'true'
         shell: pwsh
         env:
           AZURE_AD_TENANT_ID: ${{ secrets.AZURE_AD_TENANT_ID }}
@@ -268,7 +269,7 @@ jobs:
             --clientSecret $env:AZURE_AD_APPLICATION_SECRET
 
       - name: Publish MSIX to Microsoft Store
-        if: secrets.AZURE_AD_TENANT_ID != '' && secrets.AZURE_AD_APPLICATION_CLIENT_ID != '' && secrets.AZURE_AD_APPLICATION_SECRET != '' && secrets.SELLER_ID != ''
+        if: env.STORE_PUBLISH == 'true'
         shell: pwsh
         env:
           MSIX_PATH: ${{ env.MSIX_PATH }}
