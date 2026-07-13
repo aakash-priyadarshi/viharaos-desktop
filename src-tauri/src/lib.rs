@@ -124,7 +124,24 @@ pub fn run() {
     // Install panic hook FIRST, before anything else can panic
     install_panic_hook();
 
-    let mut builder = tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    // On Windows/Linux, deep links spawn a new process with the URL as argv.
+    // single-instance (with deep-link feature) must be the FIRST plugin so it
+    // forwards the URL to the existing instance and exits the duplicate.
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            log::info!("Single-instance handoff argv={:?}", argv);
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+                let _ = window.show();
+            }
+        }));
+    }
+
+    builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_fs::init())
