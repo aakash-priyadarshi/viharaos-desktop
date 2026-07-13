@@ -90,11 +90,14 @@ Add these secrets to the `viharaos-desktop` repo (Settings → Secrets → Actio
 | `AZURE_AD_APPLICATION_CLIENT_ID` | Your Entra ID app registration client ID |
 | `AZURE_AD_APPLICATION_SECRET` | Your Entra ID app registration client secret |
 | `SELLER_ID` | Your Partner Center Seller/Publisher ID |
-| `MSSTORE_PRODUCT_ID` | Your Store product ID from Partner Center |
 
-The `store-publish` job only runs when these secrets are present. If they are
+The `store-publish` job only runs when these four secrets are present. If they are
 not set, the job builds the Store installer and uploads it to the GitHub release
 but skips the Store submission.
+
+The `MSSTORE_PRODUCT_ID` is configured as an environment variable in
+`.github/workflows/desktop-release.yml` (the `store-publish` job). Update it to
+your Store product ID if it differs.
 
 ### First-time setup
 
