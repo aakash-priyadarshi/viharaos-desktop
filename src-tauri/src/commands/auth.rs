@@ -96,6 +96,43 @@ pub(crate) fn get_server_url(state: &AppState) -> String {
     "https://api.viharaos.com/api".to_string()
 }
 
+/// Ensure the organization and property referenced by a cloud user exist
+/// in the local SQLite cache so the `user` row can be inserted without
+/// violating foreign-key constraints.
+fn ensure_org_and_property_for_user(
+    conn: &rusqlite::Connection,
+    user: &CloudUser,
+) -> Result<(), String> {
+    if let Some(org_id) = &user.organization_id {
+        conn.execute(
+            "INSERT OR IGNORE INTO organization (id, name) VALUES (?1, ?1)",
+            rusqlite::params![org_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    if let Some(prop_id) = &user.property_id {
+        let org_id = user.organization_id.as_deref().unwrap_or("");
+        // property.organization_id is NOT NULL; make sure the referenced
+        // organization exists. Use an empty placeholder when the user has
+        // no organization_id; it will be reconciled on the next sync.
+        if org_id.is_empty() {
+            conn.execute(
+                "INSERT OR IGNORE INTO organization (id, name) VALUES ('', '')",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO property (id, organization_id, name) VALUES (?1, ?2, ?1)",
+            rusqlite::params![prop_id, org_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
 /// Store cloud JWT tokens and user data in the local database.
 /// Also creates a local session token for the embedded API server.
 pub(crate) fn store_cloud_session(
@@ -107,6 +144,11 @@ pub(crate) fn store_cloud_session(
 ) -> Result<String, String> {
     let conn = state.db.conn().map_err(|e| e.to_string())?;
     let session_ttl = if remember_me { "+15 days" } else { "+7 days" };
+
+    // The local user table has foreign keys to organization and property.
+    // If the sync cache hasn't pulled these rows yet, create stub rows so
+    // the upsert succeeds. The real names will be filled in on the next sync.
+    ensure_org_and_property_for_user(&conn, user)?;
 
     // Upsert the user in the local user table
     conn.execute(

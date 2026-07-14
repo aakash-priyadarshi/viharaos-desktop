@@ -6423,6 +6423,7 @@ dependencies = [
  "dirs 5.0.1",
  "env_logger",
  "hex",
+ "http-body-util",
  "image",
  "imageproc",
  "log",

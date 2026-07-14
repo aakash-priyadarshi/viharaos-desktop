@@ -1,11 +1,13 @@
 use std::sync::Arc;
 use axum::{
-    routing::{get, post, put, delete},
+    routing::{any, get, post, put, delete},
     Router,
-    extract::{State as AxumState, Path, Query},
+    body::Body,
+    extract::{Request, State as AxumState, Path, Query},
     response::Json,
     http::StatusCode,
 };
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Sha256, Digest};
@@ -123,7 +125,7 @@ async fn auth_middleware(
     // - /api/auth/refresh: refresh endpoint (uses refresh token, not access token)
     // - /images/: static image serving (loaded via <img> tags without auth headers;
     //   CORS restriction already prevents other origins from accessing these)
-    if path == "/api/health" || path == "/api/auth/login" || path == "/api/auth/refresh" || path.starts_with("/images/") {
+    if path == "/api/health" || path == "/api/auth/login" || path == "/api/auth/refresh" || path.starts_with("/api/guests/portal") || path.starts_with("/images/") {
         return Ok(next.run(request).await);
     }
 
@@ -177,6 +179,80 @@ pub async fn start_server(state: Arc<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Forward a request to the cloud API.
+/// Used by the local server for routes that are not implemented locally
+/// (e.g., the guest portal). If a local session token is present, it is
+/// swapped for the cloud JWT stored on the user record.
+async fn proxy_to_cloud(
+    AxumState(state): AxumState<Arc<AppState>>,
+    req: Request,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let (parts, body) = req.into_parts();
+    let server_url = get_server_url(&state);
+    let incoming_path = parts.uri.path();
+    let cloud_path = incoming_path.strip_prefix("/api").unwrap_or(incoming_path);
+    let mut url = format!("{}{}", server_url.trim_end_matches('/'), cloud_path);
+    if let Some(query) = parts.uri.query() {
+        url = format!("{}?{}", url, query);
+    }
+
+    let body_bytes = body.collect().await.map_err(|e| internal_error(e.to_string()))?.to_bytes();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| internal_error(e))?;
+    let mut request_builder = client.request(parts.method, &url);
+
+    // If the caller supplied a local session token, replace it with the
+    // cloud JWT so the upstream API can authenticate the request.
+    if let Some(local_token) = extract_bearer_token(&parts.headers) {
+        let conn = state.db.conn().map_err(|e| internal_error(e))?;
+        let cloud_token: Option<String> = conn
+            .query_row(
+                "SELECT u.auth_token FROM session_token st
+                 JOIN user u ON u.id = st.user_id
+                 WHERE st.token = ?1 AND st.expires_at > datetime('now')",
+                rusqlite::params![local_token],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(token) = cloud_token {
+            request_builder = request_builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token));
+        }
+    }
+
+    if let Some(content_type) = parts.headers.get(axum::http::header::CONTENT_TYPE).cloned() {
+        request_builder = request_builder.header(reqwest::header::CONTENT_TYPE, content_type);
+    }
+
+    if !body_bytes.is_empty() {
+        request_builder = request_builder.body(body_bytes);
+    }
+
+    let cloud_response = request_builder.send().await.map_err(|e| internal_error(e))?;
+    let status = cloud_response.status();
+    let cloud_headers = cloud_response.headers().clone();
+    let cloud_bytes = cloud_response.bytes().await.map_err(|e| internal_error(e))?;
+
+    let mut builder = axum::response::Response::builder();
+    builder = builder.status(status);
+    for (k, v) in cloud_headers.iter() {
+        let name = k.as_str();
+        if name.eq_ignore_ascii_case("content-encoding")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        builder = builder.header(name, v.clone());
+    }
+
+    builder
+        .body(Body::from(cloud_bytes))
+        .map_err(|e| internal_error(e))
+}
+
 fn build_router(state: Arc<AppState>) -> Router {
     let auth_state = state.clone();
 
@@ -187,6 +263,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/me", get(auth_me))
         .route("/api/auth/refresh", post(auth_refresh))
+        // Guest portal (proxied to cloud — desktop local DB does not store guest portal state)
+        .route("/api/guests/portal/*rest", any(proxy_to_cloud))
         // Guests
         .route("/api/guests", get(list_guests).post(create_guest))
         .route("/api/guests/:id", get(get_guest).put(update_guest).delete(delete_guest))
