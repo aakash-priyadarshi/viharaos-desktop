@@ -75,7 +75,6 @@ jobs:
           cargo tauri build --target ${{ matrix.target }}
 
       - name: Generate changelog
-        if: matrix.label == 'windows'
         id: changelog
         shell: bash
         run: |
