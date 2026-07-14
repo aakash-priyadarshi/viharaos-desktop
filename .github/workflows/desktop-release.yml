@@ -197,11 +197,28 @@ jobs:
         run: |
           VERSION="${{ inputs.version }}"
           TAG="desktop-v${VERSION}"
-          BUILD_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
-          # Upload .dmg, .app.tar.gz, latest.json, and .sig files
+          TARGET="${{ matrix.target }}"
+          BUILD_DIR="src-tauri/target/${TARGET}/release/bundle"
+
+          # Rename the architecture-neutral .app.tar.gz to include the target arch
+          # so the x64 and aarch64 updater bundles don't overwrite each other.
+          case "$TARGET" in
+            x86_64-apple-darwin)  ARCH_SUFFIX="x64" ;;
+            aarch64-apple-darwin) ARCH_SUFFIX="aarch64" ;;
+            *)                    ARCH_SUFFIX="${TARGET%%-*}" ;;
+          esac
+
+          for src in $(find "$BUILD_DIR" -name "*.app.tar.gz"); do
+            sig="${src}.sig"
+            dest="${BUILD_DIR}/ViharaOS_${VERSION}_${ARCH_SUFFIX}.app.tar.gz"
+            dest_sig="${dest}.sig"
+            mv "$src" "$dest"
+            mv "$sig" "$dest_sig"
+          done
+
+          # Upload .dmg, .app.tar.gz, and .sig files
           find "$BUILD_DIR" -name "*.dmg" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "*.app.tar.gz" -exec gh release upload "$TAG" {} --clobber \;
-          find "$BUILD_DIR" -name "latest.json" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "*.sig" -exec gh release upload "$TAG" {} --clobber \;
 
       - name: Verify release assets
@@ -275,3 +292,76 @@ jobs:
           MSIX_PATH: ${{ env.MSIX_PATH }}
         run: |
           msstore publish "$env:MSIX_PATH" -id "$env:MSSTORE_PRODUCT_ID"
+
+  release:
+    name: Generate and upload latest.json
+    needs: build
+    runs-on: ubuntu-latest
+    if: needs.build.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download updater signatures
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          TAG="desktop-v${VERSION}"
+          mkdir -p sigs
+          gh release download "$TAG" --pattern "*_x64_en-US.msi.sig" --dir sigs
+          gh release download "$TAG" --pattern "*_x64.app.tar.gz.sig" --dir sigs
+          gh release download "$TAG" --pattern "*_aarch64.app.tar.gz.sig" --dir sigs
+
+      - name: Generate latest.json
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          TAG="desktop-v${VERSION}"
+          BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          WIN_SIG=$(tr -d '\n' < sigs/ViharaOS_${VERSION}_x64_en-US.msi.sig)
+          MAC_X64_SIG=$(tr -d '\n' < sigs/ViharaOS_${VERSION}_x64.app.tar.gz.sig)
+          MAC_ARM_SIG=$(tr -d '\n' < sigs/ViharaOS_${VERSION}_aarch64.app.tar.gz.sig)
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg pub_date "$PUB_DATE" \
+            --arg notes "ViharaOS Desktop v$VERSION" \
+            --arg win_sig "$WIN_SIG" \
+            --arg mac_x64_sig "$MAC_X64_SIG" \
+            --arg mac_arm_sig "$MAC_ARM_SIG" \
+            --arg base "$BASE_URL" \
+            '{
+              version: $version,
+              pub_date: $pub_date,
+              notes: $notes,
+              platforms: {
+                "windows-x86_64": {
+                  signature: $win_sig,
+                  url: "\($base)/ViharaOS_\($version)_x64_en-US.msi"
+                },
+                "darwin-x86_64": {
+                  signature: $mac_x64_sig,
+                  url: "\($base)/ViharaOS_\($version)_x64.app.tar.gz"
+                },
+                "darwin-aarch64": {
+                  signature: $mac_arm_sig,
+                  url: "\($base)/ViharaOS_\($version)_aarch64.app.tar.gz"
+                }
+              }
+            }' > latest.json
+
+          cat latest.json
+
+      - name: Upload latest.json to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="desktop-v${{ inputs.version }}"
+          gh release upload "$TAG" latest.json --clobber
