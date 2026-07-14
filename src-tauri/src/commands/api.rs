@@ -271,10 +271,11 @@ async fn proxy_to_cloud(
                  JOIN user u ON u.id = st.user_id
                  WHERE st.token = ?1 AND st.expires_at > datetime('now')",
                 rusqlite::params![local_token],
-                |row| row.get(0),
+                |row| row.get::<_, Option<String>>(0),
             )
-            .ok();
-        if let Some(token) = cloud_token {
+            .ok()
+            .flatten();
+        if let Some(token) = cloud_token.filter(|t| !t.is_empty() && !t.starts_with("offline-token-")) {
             request_builder =
                 request_builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token));
         } else if let Some(auth) = parts
@@ -282,20 +283,29 @@ async fn proxy_to_cloud(
             .get(axum::http::header::AUTHORIZATION)
             .cloned()
         {
-            request_builder = request_builder.header(reqwest::header::AUTHORIZATION, auth);
+            // Prefer forwarding only if the caller already has a real JWT (not offline-token).
+            let auth_str = auth.to_str().unwrap_or("");
+            if !auth_str.contains("offline-token-") {
+                request_builder = request_builder.header(reqwest::header::AUTHORIZATION, auth);
+            } else {
+                log::warn!(
+                    "Cloud proxy called without a stored cloud JWT (path={}). Login online once so the desktop can sync cloud-only endpoints.",
+                    incoming_path
+                );
+            }
+        } else {
+            log::warn!(
+                "Cloud proxy called with no Authorization (path={})",
+                incoming_path
+            );
         }
     }
 
-    // Forward a small, safe subset of headers. Avoid copying hop-by-hop headers
-    // (Host, Connection) and CORS headers that CorsLayer will set locally.
+    // Forward a small, safe subset of headers. Avoid hop-by-hop headers and
+    // Tauri Origin (e.g. tauri://localhost) — Nest CORS only allowlists web origins;
+    // reqwest does not need browser CORS, and forwarding Origin can confuse proxies.
     if let Some(content_type) = parts.headers.get(axum::http::header::CONTENT_TYPE).cloned() {
         request_builder = request_builder.header(reqwest::header::CONTENT_TYPE, content_type);
-    }
-    if let Some(origin) = parts.headers.get(axum::http::header::ORIGIN).cloned() {
-        request_builder = request_builder.header(reqwest::header::ORIGIN, origin);
-    }
-    if let Some(referer) = parts.headers.get(axum::http::header::REFERER).cloned() {
-        request_builder = request_builder.header(reqwest::header::REFERER, referer);
     }
     if let Some(accept) = parts.headers.get(axum::http::header::ACCEPT).cloned() {
         request_builder = request_builder.header(reqwest::header::ACCEPT, accept);
@@ -304,7 +314,7 @@ async fn proxy_to_cloud(
         request_builder = request_builder.header(reqwest::header::USER_AGENT, user_agent);
     } else {
         request_builder =
-            request_builder.header(reqwest::header::USER_AGENT, "ViharaOS-Desktop/0.2.1");
+            request_builder.header(reqwest::header::USER_AGENT, "ViharaOS-Desktop/0.2.3");
     }
 
     if !body_bytes.is_empty() {
@@ -661,9 +671,10 @@ async fn auth_login(
                 rusqlite::params![&id],
             );
 
+            let remember_me = req.remember_me.unwrap_or(false);
             // Generate a session token and store it for API auth
             let token = format!("offline-token-{}", uuid::Uuid::new_v4());
-            let session_ttl = if req.remember_me.unwrap_or(false) {
+            let session_ttl = if remember_me {
                 "+15 days"
             } else {
                 "+7 days"
@@ -677,11 +688,21 @@ async fn auth_login(
                 "DELETE FROM session_token WHERE expires_at < datetime('now')",
                 [],
             );
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO sync_settings (key, value) VALUES ('remember_me', ?1)",
+                rusqlite::params![if remember_me { "1" } else { "0" }],
+            );
+
+            let is_platform_admin = role == "SYSTEM_ADMIN";
+            let can_manage_staff = matches!(
+                role.as_str(),
+                "SYSTEM_ADMIN" | "HOTEL_ADMIN" | "OWNER" | "GENERAL_MANAGER"
+            );
 
             Ok(Json(json!({
                 "accessToken": token.clone(),
                 "refreshToken": token,
-                "rememberMe": req.remember_me.unwrap_or(false),
+                "rememberMe": remember_me,
                 "user": {
                     "id": id,
                     "email": email,
@@ -689,8 +710,8 @@ async fn auth_login(
                     "role": role,
                     "organizationId": org_id,
                     "propertyId": prop_id,
-                    "isPlatformAdmin": false,
-                    "canManageStaff": false,
+                    "isPlatformAdmin": is_platform_admin,
+                    "canManageStaff": can_manage_staff,
                     "managedHotelIds": [],
                 }
             })))
@@ -719,15 +740,21 @@ async fn auth_me(
              WHERE st.token = ?1 AND st.expires_at > datetime('now') AND u.is_active = 1",
             rusqlite::params![token],
             |row| {
+                let role: String = row.get(3)?;
+                let is_platform_admin = role == "SYSTEM_ADMIN";
+                let can_manage_staff = matches!(
+                    role.as_str(),
+                    "SYSTEM_ADMIN" | "HOTEL_ADMIN" | "OWNER" | "GENERAL_MANAGER"
+                );
                 Ok(json!({
                     "id": row.get::<_, String>(0)?,
                     "email": row.get::<_, String>(1)?,
                     "name": row.get::<_, String>(2)?,
-                    "role": row.get::<_, String>(3)?,
+                    "role": role,
                     "organizationId": row.get::<_, Option<String>>(4)?,
                     "propertyId": row.get::<_, Option<String>>(5)?,
-                    "isPlatformAdmin": false,
-                    "canManageStaff": false,
+                    "isPlatformAdmin": is_platform_admin,
+                    "canManageStaff": can_manage_staff,
                     "managedHotelIds": [],
                 }))
             },
@@ -746,32 +773,106 @@ async fn auth_refresh(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
-    let user_id: Option<String> = conn
+    let user_row: Option<(String, Option<String>)> = conn
         .query_row(
-            "SELECT user_id FROM session_token
-             WHERE token = ?1 AND expires_at > datetime('now')
+            "SELECT st.user_id, u.refresh_token
+             FROM session_token st
+             JOIN user u ON u.id = st.user_id
+             WHERE st.token = ?1 AND st.expires_at > datetime('now')
              UNION
-             SELECT id FROM user
+             SELECT id, refresh_token FROM user
              WHERE refresh_token = ?1
                AND is_active = 1
                AND (token_expires_at IS NULL OR token_expires_at > datetime('now'))
              LIMIT 1",
             rusqlite::params![&req.refresh_token],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .ok();
 
-    let Some(user_id) = user_id else {
+    let Some((user_id, cloud_refresh)) = user_row else {
         return Err((
             StatusCode::UNAUTHORIZED,
             "Invalid refresh token".to_string(),
         ));
     };
 
+    let remember_me: bool = conn
+        .query_row(
+            "SELECT value FROM sync_settings WHERE key = 'remember_me'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|v| v == "1")
+        .unwrap_or(true);
+    let session_ttl = if remember_me { "+15 days" } else { "+7 days" };
+
+    // Best-effort: refresh the cloud JWT so proxied endpoints keep working
+    // after the ~15m access-token TTL. Local session remains valid either way.
+    if let Some(ref cloud_rt) = cloud_refresh {
+        if !cloud_rt.is_empty()
+            && !cloud_rt.starts_with("offline-token-")
+            && !cloud_rt.starts_with("browser-")
+        {
+            let server_url = get_server_url(&state);
+            if let Ok(client) = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+            {
+                match client
+                    .post(format!("{}/auth/refresh", server_url))
+                    .json(&json!({ "refreshToken": cloud_rt }))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(body) = resp.json::<Value>().await {
+                            let new_access = body
+                                .get("accessToken")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let new_refresh = body
+                                .get("refreshToken")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .or_else(|| Some(cloud_rt.clone()));
+                            if let (Some(access), Some(refresh)) = (new_access, new_refresh) {
+                                let _ = conn.execute(
+                                    "UPDATE user SET auth_token = ?1, refresh_token = ?2,
+                                     token_expires_at = datetime('now', ?3) WHERE id = ?4",
+                                    rusqlite::params![&access, &refresh, session_ttl, &user_id],
+                                );
+                                let _ = conn.execute(
+                                    "INSERT OR REPLACE INTO sync_settings (key, value) VALUES ('auth_token', ?1)",
+                                    rusqlite::params![&access],
+                                );
+                                log::info!("Refreshed cloud JWT for user {}", user_id);
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        log::warn!(
+                            "Cloud JWT refresh failed for user {}: HTTP {}",
+                            user_id,
+                            resp.status()
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Cloud JWT refresh unavailable for user {}: {}",
+                            user_id,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     let token = format!("offline-token-{}", uuid::Uuid::new_v4());
     conn.execute(
-        "INSERT INTO session_token (token, user_id, expires_at) VALUES (?1, ?2, datetime('now', '+15 days'))",
-        rusqlite::params![&token, user_id],
+        "INSERT INTO session_token (token, user_id, expires_at) VALUES (?1, ?2, datetime('now', ?3))",
+        rusqlite::params![&token, user_id, session_ttl],
     )
     .map_err(|e| internal_error(e))?;
 
@@ -781,7 +882,7 @@ async fn auth_refresh(
     );
 
     Ok(Json(
-        json!({ "accessToken": token.clone(), "refreshToken": token }),
+        json!({ "accessToken": token.clone(), "refreshToken": token, "rememberMe": remember_me }),
     ))
 }
 
@@ -856,7 +957,8 @@ async fn list_guests(
         .map_err(|e| internal_error(e))?;
 
     let guests: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
-    Ok(Json(json!({ "data": guests, "count": guests.len() })))
+    // NestJS returns a bare array — wrap breaks `api<Guest[]>` callers.
+    Ok(Json(json!(guests)))
 }
 
 async fn create_guest(
@@ -1129,7 +1231,8 @@ async fn list_rooms(
         .map_err(|e| internal_error(e))?;
 
     let rooms: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
-    Ok(Json(json!({ "data": rooms, "count": rooms.len() })))
+    // NestJS returns a bare array — wrap breaks `api<Room[]>` callers.
+    Ok(Json(json!(rooms)))
 }
 
 async fn create_room(
@@ -1323,7 +1426,7 @@ async fn list_reservations(
                     r.status, r.source, r.check_in_date, r.check_out_date,
                     r.adults, r.children, r.rate_amount, r.currency,
                     r.special_requests, r.created_at, r.checked_in_at, r.checked_out_at,
-                    g.first_name, g.last_name, g.phone,
+                    g.first_name, g.last_name, g.phone, g.nationality, g.email,
                     rm.number as room_number
              FROM reservation r
              LEFT JOIN guest g ON r.guest_id = g.id
@@ -1335,36 +1438,58 @@ async fn list_reservations(
 
     let rows = stmt
         .query_map(rusqlite::params![property_id], |row| {
+            let id: String = row.get(0)?;
+            let room_id: Option<String> = row.get(3)?;
+            let rate: f64 = row.get(11)?;
+            let special: Option<String> = row.get(13)?;
+            let guest_first: Option<String> = row.get(17)?;
+            let guest_last: Option<String> = row.get(18)?;
+            let guest_phone: Option<String> = row.get(19)?;
+            let guest_nationality: Option<String> = row.get(20)?;
+            let guest_email: Option<String> = row.get(21)?;
+            let room_number: Option<String> = row.get(22)?;
+
+            // Shape must match NestJS ReservationDTO consumed by the web UI:
+            // bare array of { checkIn, checkOut, guest: {...}, rooms: [...] }.
+            let rooms = if room_id.is_some() || room_number.is_some() {
+                json!([{
+                    "id": format!("{}-room", id),
+                    "roomId": room_id,
+                    "ratePerNight": rate,
+                    "room": room_number.as_ref().map(|n| json!({ "number": n, "roomType": null })),
+                }])
+            } else {
+                json!([])
+            };
+
             Ok(json!({
-                "id": row.get::<_, String>(0)?,
+                "id": id,
+                "code": format!("RSV-{}", &id[..8.min(id.len())]),
                 "propertyId": row.get::<_, String>(1)?,
                 "guestId": row.get::<_, String>(2)?,
-                "roomId": row.get::<_, Option<String>>(3)?,
-                "roomTypeId": row.get::<_, Option<String>>(4)?,
                 "status": row.get::<_, String>(5)?,
-                "source": row.get::<_, Option<String>>(6)?,
-                "checkInDate": row.get::<_, String>(7)?,
-                "checkOutDate": row.get::<_, String>(8)?,
+                "source": row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "DIRECT".to_string()),
+                "checkIn": row.get::<_, String>(7)?,
+                "checkOut": row.get::<_, String>(8)?,
                 "adults": row.get::<_, i32>(9)?,
                 "children": row.get::<_, i32>(10)?,
-                "rateAmount": row.get::<_, f64>(11)?,
-                "currency": row.get::<_, String>(12)?,
-                "specialRequests": row.get::<_, Option<String>>(13)?,
+                "notes": special,
+                "eta": null,
                 "createdAt": row.get::<_, String>(14)?,
-                "checkedInAt": row.get::<_, Option<String>>(15)?,
-                "checkedOutAt": row.get::<_, Option<String>>(16)?,
-                "guestFirstName": row.get::<_, Option<String>>(17)?,
-                "guestLastName": row.get::<_, Option<String>>(18)?,
-                "guestPhone": row.get::<_, Option<String>>(19)?,
-                "roomNumber": row.get::<_, Option<String>>(20)?,
+                "guest": {
+                    "firstName": guest_first.unwrap_or_default(),
+                    "lastName": guest_last,
+                    "phone": guest_phone,
+                    "email": guest_email,
+                    "nationality": guest_nationality.unwrap_or_else(|| "IN".to_string()),
+                },
+                "rooms": rooms,
             }))
         })
         .map_err(|e| internal_error(e))?;
 
     let reservations: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
-    Ok(Json(
-        json!({ "data": reservations, "count": reservations.len() }),
-    ))
+    Ok(Json(json!(reservations)))
 }
 
 async fn create_reservation(

@@ -160,6 +160,7 @@ pub struct MediaAsset {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageQuota {
     pub id: String,
     pub organization_id: String,
@@ -169,6 +170,7 @@ pub struct StorageQuota {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncOutboxEntry {
     pub id: String,
     pub idempotency_key: String,
@@ -188,7 +190,9 @@ pub struct SyncOutboxEntry {
     pub retry_count: i32,
 }
 
+/// IPC contract with the web UI — must serialize as camelCase (`isOnline`, not `is_online`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
     pub enabled: bool,
     pub last_sync_at: Option<String>,

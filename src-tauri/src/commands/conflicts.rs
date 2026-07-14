@@ -6,6 +6,7 @@ use crate::AppState;
 
 /// A sync conflict entry from the local SQLite database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncConflict {
     pub id: String,
     pub entity_type: String,

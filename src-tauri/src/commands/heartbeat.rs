@@ -7,6 +7,7 @@ use crate::AppState;
 /// Local device heartbeat state — mirrors what we send to the cloud
 /// and what the Offline Operations Center displays.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeviceHeartbeat {
     pub device_id: String,
     pub user_id: Option<String>,
@@ -460,6 +461,7 @@ pub async fn send_heartbeat_to_cloud(
 
 /// A single sync outbox queue entry — used by the Offline Operations Center queue tab.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncOutboxEntry {
     pub id: String,
     pub entity_type: String,

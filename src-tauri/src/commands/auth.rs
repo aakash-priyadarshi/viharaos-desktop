@@ -194,8 +194,97 @@ pub(crate) fn store_cloud_session(
         "INSERT OR REPLACE INTO sync_settings (key, value) VALUES ('server_url', ?1)",
         rusqlite::params![get_server_url(state)],
     );
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO sync_settings (key, value) VALUES ('remember_me', ?1)",
+        rusqlite::params![if remember_me { "1" } else { "0" }],
+    );
 
     Ok(session_token)
+}
+
+/// Return the newest non-expired local staff session, if any.
+/// Used by the web AuthProvider on desktop cold start when cookies were lost.
+#[tauri::command]
+pub async fn get_active_session(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Option<BrowserLoginResult>, String> {
+    let conn = state.db.conn().map_err(|e| e.to_string())?;
+
+    let remember_me_flag: String = conn
+        .query_row(
+            "SELECT value FROM sync_settings WHERE key = 'remember_me'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "0".to_string());
+    let remember_me = remember_me_flag == "1";
+
+    let result = conn.query_row(
+        "SELECT st.token, u.id, u.email, u.name, u.role, u.organization_id, u.property_id
+         FROM session_token st
+         JOIN user u ON u.id = st.user_id
+         WHERE st.expires_at > datetime('now') AND u.is_active = 1
+         ORDER BY st.expires_at DESC
+         LIMIT 1",
+        [],
+        |row| {
+            let token: String = row.get(0)?;
+            let role: String = row.get(4)?;
+            let is_platform_admin = role == "SYSTEM_ADMIN";
+            let can_manage_staff = matches!(
+                role.as_str(),
+                "SYSTEM_ADMIN" | "HOTEL_ADMIN" | "OWNER" | "GENERAL_MANAGER"
+            );
+            Ok(BrowserLoginResult {
+                access_token: token.clone(),
+                refresh_token: token,
+                user: BrowserLoginUser {
+                    id: row.get(1)?,
+                    email: row.get(2)?,
+                    name: row.get(3)?,
+                    role,
+                    organization_id: row.get(5)?,
+                    property_id: row.get(6)?,
+                    is_platform_admin,
+                    can_manage_staff,
+                    managed_hotel_ids: Vec::new(),
+                },
+                remember_me,
+            })
+        },
+    );
+
+    match result {
+        Ok(session) => {
+            log::info!(
+                "Restored active session for user {} ({})",
+                session.user.email,
+                session.user.id
+            );
+            Ok(Some(session))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Explicit logout: wipe local session tokens and cached cloud JWTs.
+#[tauri::command]
+pub async fn clear_local_sessions(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let conn = state.db.conn().map_err(|e| e.to_string())?;
+    let _ = conn.execute("DELETE FROM session_token", []);
+    let _ = conn.execute(
+        "UPDATE user SET auth_token = NULL, refresh_token = NULL, token_expires_at = NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "DELETE FROM sync_settings WHERE key IN ('auth_token', 'remember_me')",
+        [],
+    );
+    log::info!("Cleared local staff sessions");
+    Ok(())
 }
 
 /// Initiate browser-based login using the OAuth device authorization flow.

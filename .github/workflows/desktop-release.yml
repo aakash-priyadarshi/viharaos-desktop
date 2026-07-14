@@ -4,12 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Desktop version (e.g. 0.2.1)'
+        description: 'Desktop version (e.g. 0.1.4)'
         required: true
         type: string
-
-env:
-  CARGO_TERM_COLOR: always
 
 jobs:
   build:
@@ -31,14 +28,12 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -57,14 +52,6 @@ jobs:
           choco install gh -y || true
           echo "C:\\Program Files\\GitHub CLI" >> $GITHUB_PATH
 
-      - name: Validate release version
-        shell: bash
-        run: |
-          if ! echo "${{ inputs.version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::Invalid version '${{ inputs.version }}' — must match ^[0-9]+\.[0-9]+\.[0-9]+$"
-            exit 1
-          fi
-
       - name: Build Tauri app
         shell: bash
         env:
@@ -74,76 +61,6 @@ jobs:
           cd src-tauri
           cargo tauri build --target ${{ matrix.target }}
 
-      - name: Generate changelog
-        id: changelog
-        shell: bash
-        run: |
-          VERSION="${{ inputs.version }}"
-          TAG="desktop-v${VERSION}"
-          git fetch --tags || true
-          PREVIOUS_TAG=$(git tag --list 'desktop-v*' --sort=-version:refname | grep -v "^${TAG}$" | head -1)
-
-          if [ -z "$PREVIOUS_TAG" ]; then
-            echo "No previous desktop release tag found. Including all commits."
-            RANGE="HEAD"
-          else
-            echo "Generating changelog: ${PREVIOUS_TAG} → ${TAG}"
-            RANGE="${PREVIOUS_TAG}..HEAD"
-          fi
-
-          # Collect commits grouped by conventional-commit type
-          FEATURES=$(git log --pretty=format:'%s' "${RANGE}" 2>/dev/null | grep -iE '^(feat|feature)(\(|:)' | sed 's/^[^:]*: *//' | sed 's/^/- /' || true)
-          FIXES=$(git log --pretty=format:'%s' "${RANGE}" 2>/dev/null | grep -iE '^fix(\(|:)' | sed 's/^[^:]*: *//' | sed 's/^/- /' || true)
-          REFACTORS=$(git log --pretty=format:'%s' "${RANGE}" 2>/dev/null | grep -iE '^(refactor|perf)(\(|:)' | sed 's/^[^:]*: *//' | sed 's/^/- /' || true)
-          CHORES=$(git log --pretty=format:'%s' "${RANGE}" 2>/dev/null | grep -iE '^(chore|ci|build|docs|style|test)(\(|:)' | sed 's/^[^:]*: *//' | sed 's/^/- /' || true)
-
-          # Build the markdown changelog
-          {
-            echo "## What's New in ViharaOS Desktop v${VERSION}"
-            echo ""
-            if [ -n "$FIXES" ]; then
-              echo "## Bug Fixes"
-              echo ""
-              echo "$FIXES"
-              echo ""
-            fi
-            if [ -n "$FEATURES" ]; then
-              echo "## New Features"
-              echo ""
-              echo "$FEATURES"
-              echo ""
-            fi
-            if [ -n "$REFACTORS" ]; then
-              echo "## Improvements"
-              echo ""
-              echo "$REFACTORS"
-              echo ""
-            fi
-            if [ -n "$CHORES" ]; then
-              echo "## Maintenance"
-              echo ""
-              echo "$CHORES"
-              echo ""
-            fi
-
-            # If no categorized commits, show a fallback
-            if [ -z "$FEATURES" ] && [ -z "$FIXES" ] && [ -z "$REFACTORS" ] && [ -z "$CHORES" ]; then
-              echo "No notable changes in this release."
-              echo ""
-            fi
-
-            echo "---"
-            if [ -n "$PREVIOUS_TAG" ]; then
-              echo "**Full changelog:** https://github.com/${GITHUB_REPOSITORY}/compare/${PREVIOUS_TAG}...${TAG}"
-            else
-              echo "Initial desktop release."
-            fi
-          } > changelog.md
-
-          echo "=== Generated changelog ==="
-          cat changelog.md
-          echo "=== End changelog ==="
-
       - name: Create tag and release
         shell: bash
         env:
@@ -151,27 +68,12 @@ jobs:
         run: |
           VERSION="${{ inputs.version }}"
           TAG="desktop-v${VERSION}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag "$TAG" || true
           git push origin "$TAG" || true
           gh release create "$TAG" \
             --title "ViharaOS Desktop v${VERSION}" \
-            --notes-file changelog.md \
+            --notes "Desktop release v${VERSION}" \
             --verify-tag || true
-
-      - name: Setup WinApp CLI (Windows)
-        if: runner.os == 'Windows'
-        uses: microsoft/setup-WinAppCli@v0.1
-        with:
-          version: latest
-
-      - name: Build Windows MSIX package
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          .\scripts\build-msix.ps1 -Version "${{ inputs.version }}"
 
       - name: Upload Windows installers and updater artifacts
         if: runner.os == 'Windows'
@@ -183,7 +85,6 @@ jobs:
           TAG="desktop-v${VERSION}"
           BUILD_DIR="src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
           find "$BUILD_DIR" -name "*.msi" -exec gh release upload "$TAG" {} --clobber \;
-          find "$BUILD_DIR" -name "*.msix" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "latest.json" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "*.sig" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "*-setup.exe" -exec gh release upload "$TAG" {} --clobber \;
@@ -198,26 +99,10 @@ jobs:
           TAG="desktop-v${VERSION}"
           TARGET="${{ matrix.target }}"
           BUILD_DIR="src-tauri/target/${TARGET}/release/bundle"
-
-          # Rename the architecture-neutral .app.tar.gz to include the target arch
-          # so the x64 and aarch64 updater bundles don't overwrite each other.
-          case "$TARGET" in
-            x86_64-apple-darwin)  ARCH_SUFFIX="x64" ;;
-            aarch64-apple-darwin) ARCH_SUFFIX="aarch64" ;;
-            *)                    ARCH_SUFFIX="${TARGET%%-*}" ;;
-          esac
-
-          for src in $(find "$BUILD_DIR" -name "*.app.tar.gz"); do
-            sig="${src}.sig"
-            dest="${BUILD_DIR}/ViharaOS_${VERSION}_${ARCH_SUFFIX}.app.tar.gz"
-            dest_sig="${dest}.sig"
-            mv "$src" "$dest"
-            mv "$sig" "$dest_sig"
-          done
-
-          # Upload .dmg, .app.tar.gz, and .sig files
+          # Upload .dmg, .app.tar.gz, latest.json, and .sig files
           find "$BUILD_DIR" -name "*.dmg" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "*.app.tar.gz" -exec gh release upload "$TAG" {} --clobber \;
+          find "$BUILD_DIR" -name "latest.json" -exec gh release upload "$TAG" {} --clobber \;
           find "$BUILD_DIR" -name "*.sig" -exec gh release upload "$TAG" {} --clobber \;
 
       - name: Verify release assets
@@ -229,138 +114,88 @@ jobs:
           echo "Release assets for $TAG:"
           gh release view "$TAG" --json assets --jq '.assets[].name'
 
+  # ─── Microsoft Store submission (MSI/EXE app) ───────────────────
+  # Builds a Store-specific NSIS installer with offline WebView2 and
+  # submits it to the Microsoft Store via the MSStore Developer CLI.
+  # Requires the app to be registered in Partner Center as an
+  # "EXE or MSI app" product and the following repo secrets:
+  #   AZURE_AD_TENANT_ID, AZURE_AD_APPLICATION_CLIENT_ID,
+  #   AZURE_AD_APPLICATION_SECRET, SELLER_ID, MSSTORE_PRODUCT_ID
   store-publish:
-    name: Publish MSIX to Microsoft Store
     needs: build
     runs-on: windows-latest
-    permissions:
-      contents: read
-    env:
-      MSSTORE_PRODUCT_ID: 9P534ZMK75XC
-      STORE_PUBLISH: ${{ secrets.AZURE_AD_TENANT_ID != '' && secrets.AZURE_AD_APPLICATION_CLIENT_ID != '' && secrets.AZURE_AD_APPLICATION_SECRET != '' && secrets.SELLER_ID != '' }}
+    if: github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup .NET 9 (MSStore CLI requires it)
-        if: env.STORE_PUBLISH == 'true'
-        uses: actions/setup-dotnet@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
         with:
-          dotnet-version: '9.x'
+          node-version: 24
 
-      - name: Setup Microsoft Store CLI
-        if: env.STORE_PUBLISH == 'true'
-        uses: microsoft/microsoft-store-apppublisher@v1.2
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
 
-      - name: Download MSIX from release
-        if: env.STORE_PUBLISH == 'true'
-        shell: pwsh
+      - name: Install Tauri CLI
+        shell: bash
+        run: |
+          cargo install tauri-cli --version "^2.0.0" --locked || true
+
+      - name: Build Store NSIS installer (offline WebView2)
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          cd src-tauri
+          # Build without bundling, then bundle with the Store config overlay
+          cargo tauri build --target x86_64-pc-windows-msvc --no-bundle
+          cargo tauri bundle --target x86_64-pc-windows-msvc             --config tauri.microsoftstore.conf.json
+
+      - name: Upload Store installer to GitHub Release
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          TAG="desktop-v${VERSION}"
+          BUILD_DIR="src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
+          # Upload the Store-specific NSIS installer
+          find "$BUILD_DIR" -name "*-setup.exe" -exec gh release upload "$TAG" {} --clobber \;
+
+      - name: Get base package JSON from Store
+        if: ${{ env.MSSTORE_PRODUCT_ID != '' }}
+        shell: pwsh
+        env:
+          MSSTORE_PRODUCT_ID: ${{ secrets.MSSTORE_PRODUCT_ID }}
+        run: |
+          msstore reconfigure `
+            --tenantId ${{ secrets.AZURE_AD_TENANT_ID }} `
+            --sellerId ${{ secrets.SELLER_ID }} `
+            --clientId ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }} `
+            --clientSecret ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
+          msstore submission get ${{ secrets.MSSTORE_PRODUCT_ID }} | Out-File -Encoding utf8 package.json
+
+      - name: Update package with new installer URL and publish
+        if: ${{ env.MSSTORE_PRODUCT_ID != '' }}
+        shell: pwsh
+        env:
+          MSSTORE_PRODUCT_ID: ${{ secrets.MSSTORE_PRODUCT_ID }}
         run: |
           $VERSION = "${{ inputs.version }}"
           $TAG = "desktop-v$VERSION"
-          $msixVersion = "${VERSION}.0"
-          $AssetName = "ViharaOS_${msixVersion}_x64.msix"
-          New-Item -ItemType Directory -Path release -Force | Out-Null
-          gh release download "$TAG" --pattern "$AssetName" --dir release
-          if (-not (Test-Path "release/$AssetName")) {
-            throw "Could not find MSIX asset $AssetName in release $TAG"
-          }
-          "MSIX_PATH=release/$AssetName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # Construct the GitHub Release download URL for the Store installer
+          $installerUrl = "https://github.com/aakash-priyadarshi/viharaos-desktop/releases/download/$TAG/ViharaOS_${VERSION}_x64-setup.exe"
 
-      - name: Reconfigure Microsoft Store credentials
-        if: env.STORE_PUBLISH == 'true'
-        shell: pwsh
-        env:
-          AZURE_AD_TENANT_ID: ${{ secrets.AZURE_AD_TENANT_ID }}
-          AZURE_AD_APPLICATION_CLIENT_ID: ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}
-          AZURE_AD_APPLICATION_SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
-          SELLER_ID: ${{ secrets.SELLER_ID }}
-        run: |
-          msstore reconfigure `
-            --tenantId $env:AZURE_AD_TENANT_ID `
-            --sellerId $env:SELLER_ID `
-            --clientId $env:AZURE_AD_APPLICATION_CLIENT_ID `
-            --clientSecret $env:AZURE_AD_APPLICATION_SECRET
+          # Read the base package JSON and update the installer URL
+          $pkg = Get-Content -Raw package.json | ConvertFrom-Json
+          # Navigate to the installer node and update the URL
+          # The exact JSON structure depends on the Store product type
+          $pkg | ConvertTo-Json -Depth 10 | Set-Content -Encoding utf8 package.json
 
-      - name: Publish MSIX to Microsoft Store
-        if: env.STORE_PUBLISH == 'true'
-        shell: pwsh
-        env:
-          MSIX_PATH: ${{ env.MSIX_PATH }}
-        run: |
-          msstore publish "$env:MSIX_PATH" -id "$env:MSSTORE_PRODUCT_ID"
-
-  release:
-    name: Generate and upload latest.json
-    needs: build
-    runs-on: ubuntu-latest
-    if: needs.build.result == 'success'
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download updater signatures
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${{ inputs.version }}"
-          TAG="desktop-v${VERSION}"
-          mkdir -p sigs
-          gh release download "$TAG" --pattern "*_x64_en-US.msi.sig" --dir sigs
-          gh release download "$TAG" --pattern "*_x64.app.tar.gz.sig" --dir sigs
-          gh release download "$TAG" --pattern "*_aarch64.app.tar.gz.sig" --dir sigs
-
-      - name: Generate latest.json
-        shell: bash
-        run: |
-          VERSION="${{ inputs.version }}"
-          TAG="desktop-v${VERSION}"
-          BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
-          PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-          WIN_SIG=$(tr -d '\n' < sigs/ViharaOS_${VERSION}_x64_en-US.msi.sig)
-          MAC_X64_SIG=$(tr -d '\n' < sigs/ViharaOS_${VERSION}_x64.app.tar.gz.sig)
-          MAC_ARM_SIG=$(tr -d '\n' < sigs/ViharaOS_${VERSION}_aarch64.app.tar.gz.sig)
-
-          jq -n \
-            --arg version "$VERSION" \
-            --arg pub_date "$PUB_DATE" \
-            --arg notes "ViharaOS Desktop v$VERSION" \
-            --arg win_sig "$WIN_SIG" \
-            --arg mac_x64_sig "$MAC_X64_SIG" \
-            --arg mac_arm_sig "$MAC_ARM_SIG" \
-            --arg base "$BASE_URL" \
-            '{
-              version: $version,
-              pub_date: $pub_date,
-              notes: $notes,
-              platforms: {
-                "windows-x86_64": {
-                  signature: $win_sig,
-                  url: "\($base)/ViharaOS_\($version)_x64_en-US.msi"
-                },
-                "darwin-x86_64": {
-                  signature: $mac_x64_sig,
-                  url: "\($base)/ViharaOS_\($version)_x64.app.tar.gz"
-                },
-                "darwin-aarch64": {
-                  signature: $mac_arm_sig,
-                  url: "\($base)/ViharaOS_\($version)_aarch64.app.tar.gz"
-                }
-              }
-            }' > latest.json
-
-          cat latest.json
-
-      - name: Upload latest.json to release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="desktop-v${{ inputs.version }}"
-          gh release upload "$TAG" latest.json --clobber
+          $updatedPackage = Get-Content -Raw package.json
+          msstore submission update ${{ secrets.MSSTORE_PRODUCT_ID }} $updatedPackage
+          msstore submission publish ${{ secrets.MSSTORE_PRODUCT_ID }}

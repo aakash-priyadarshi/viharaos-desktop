@@ -312,6 +312,8 @@ pub fn run() {
             commands::conflicts::resolve_conflict_manual,
             commands::api::store_password_hash,
             commands::auth::login_with_browser,
+            commands::auth::get_active_session,
+            commands::auth::clear_local_sessions,
         ])
         // Run generate_context!() in a separate thread with a larger stack
         // (8MB) to avoid stack overflow on Windows where the main thread

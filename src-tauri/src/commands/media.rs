@@ -9,6 +9,7 @@ use crate::image::{delete_file, dir_size, generate_variants, save_to_file, Image
 use crate::AppState;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveImageRequest {
     pub entity: String, // menu-items, guests, employees, rooms, etc.
     pub entity_id: String,
@@ -46,6 +47,7 @@ fn check_folder_permission(role: &str, entity: &str) -> bool {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveImageResponse {
     pub thumb_path: String,
     pub medium_path: String,

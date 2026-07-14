@@ -1,6 +1,6 @@
 {
   "productName": "ViharaOS",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "identifier": "com.viharaos.desktop",
   "build": {
     "frontendDist": "../out",
@@ -12,7 +12,7 @@
     "windows": [
       {
         "title": "ViharaOS — Hotel Management System",
-        "url": "/login",
+        "url": "/dashboard",
         "width": 1280,
         "height": 800,
         "minWidth": 1024,
