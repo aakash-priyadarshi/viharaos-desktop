@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
-use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 

@@ -185,10 +185,14 @@ pub(crate) fn store_cloud_session(
         [],
     );
 
-    // Store the auth token in sync_settings for the sync engine
+    // Store the auth token and server URL in sync_settings for the sync engine
     let _ = conn.execute(
         "INSERT OR REPLACE INTO sync_settings (key, value) VALUES ('auth_token', ?1)",
         rusqlite::params![access_token],
+    );
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO sync_settings (key, value) VALUES ('server_url', ?1)",
+        rusqlite::params![get_server_url(state)],
     );
 
     Ok(session_token)

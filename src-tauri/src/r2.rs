@@ -1,6 +1,6 @@
-use std::path::Path;
-use serde::{Deserialize, Serialize};
 use crate::image::ImageError;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// R2 configuration loaded from sync_settings or environment.
 #[derive(Debug, Clone)]
@@ -9,7 +9,7 @@ pub struct R2Config {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub bucket_name: String,
-    pub public_base_url: String,  // e.g. https://media.viharaos.dev
+    pub public_base_url: String, // e.g. https://media.viharaos.dev
 }
 
 /// Result of uploading a single file to R2.
@@ -66,7 +66,11 @@ pub async fn upload_to_r2(
         return Err(format!("R2 upload failed (HTTP {}): {}", status, body));
     }
 
-    let public_url = format!("{}/{}", config.public_base_url.trim_end_matches('/'), r2_key);
+    let public_url = format!(
+        "{}/{}",
+        config.public_base_url.trim_end_matches('/'),
+        r2_key
+    );
 
     Ok(R2UploadResult {
         r2_key: r2_key.to_string(),
@@ -76,10 +80,7 @@ pub async fn upload_to_r2(
 }
 
 /// Delete a file from R2.
-pub async fn delete_from_r2(
-    config: &R2Config,
-    r2_key: &str,
-) -> Result<(), String> {
+pub async fn delete_from_r2(config: &R2Config, r2_key: &str) -> Result<(), String> {
     let endpoint = format!(
         "https://{}.r2.cloudflarestorage.com/{}/{}",
         config.account_id, config.bucket_name, r2_key
@@ -127,15 +128,20 @@ pub fn load_r2_config(db: &crate::db::Database) -> Option<R2Config> {
     };
 
     // Try environment variables first, then sync_settings
-    let account_id = std::env::var("R2_ACCOUNT_ID").ok()
+    let account_id = std::env::var("R2_ACCOUNT_ID")
+        .ok()
         .or_else(|| get_setting("r2_account_id"))?;
-    let access_key_id = std::env::var("R2_ACCESS_KEY_ID").ok()
+    let access_key_id = std::env::var("R2_ACCESS_KEY_ID")
+        .ok()
         .or_else(|| get_setting("r2_access_key_id"))?;
-    let secret_access_key = std::env::var("R2_SECRET_ACCESS_KEY").ok()
+    let secret_access_key = std::env::var("R2_SECRET_ACCESS_KEY")
+        .ok()
         .or_else(|| get_setting("r2_secret_access_key"))?;
-    let bucket_name = std::env::var("R2_BUCKET_NAME").ok()
+    let bucket_name = std::env::var("R2_BUCKET_NAME")
+        .ok()
         .or_else(|| get_setting("r2_bucket_name"))?;
-    let public_base_url = std::env::var("R2_PUBLIC_BASE_URL").ok()
+    let public_base_url = std::env::var("R2_PUBLIC_BASE_URL")
+        .ok()
         .or_else(|| get_setting("r2_public_base_url"))
         .unwrap_or_else(|| format!("https://{}.r2.dev", bucket_name));
 
@@ -155,8 +161,7 @@ pub async fn sync_media_to_r2(
     images_dir: &Path,
     organization_id: &str,
 ) -> Result<(i32, i64), String> {
-    let config = load_r2_config(db)
-        .ok_or("R2 not configured — set R2 credentials in settings")?;
+    let config = load_r2_config(db).ok_or("R2 not configured — set R2 credentials in settings")?;
 
     // Get unsynced media assets
     let unsynced: Vec<MediaAssetRow> = {
@@ -255,8 +260,7 @@ pub async fn delete_entity_from_r2(
     entity: &str,
     entity_id: &str,
 ) -> Result<(), String> {
-    let config = load_r2_config(db)
-        .ok_or("R2 not configured")?;
+    let config = load_r2_config(db).ok_or("R2 not configured")?;
 
     // Get R2 keys for this entity
     let r2_keys: Vec<String> = {
@@ -269,9 +273,10 @@ pub async fn delete_entity_from_r2(
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(rusqlite::params![organization_id, entity, entity_id], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(
+                rusqlite::params![organization_id, entity, entity_id],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     };
@@ -324,15 +329,29 @@ mod tests {
             public_base_url: "https://media.viharaos.com/".to_string(),
             ..test_config()
         };
-        let public_url = format!("{}/{}", config.public_base_url.trim_end_matches('/'), "org-1/guests/g-1/thumb.webp");
-        assert_eq!(public_url, "https://media.viharaos.com/org-1/guests/g-1/thumb.webp");
+        let public_url = format!(
+            "{}/{}",
+            config.public_base_url.trim_end_matches('/'),
+            "org-1/guests/g-1/thumb.webp"
+        );
+        assert_eq!(
+            public_url,
+            "https://media.viharaos.com/org-1/guests/g-1/thumb.webp"
+        );
     }
 
     #[test]
     fn public_url_without_trailing_slash() {
         let config = test_config();
-        let public_url = format!("{}/{}", config.public_base_url.trim_end_matches('/'), "org-1/guests/g-1/thumb.webp");
-        assert_eq!(public_url, "https://media.viharaos.com/org-1/guests/g-1/thumb.webp");
+        let public_url = format!(
+            "{}/{}",
+            config.public_base_url.trim_end_matches('/'),
+            "org-1/guests/g-1/thumb.webp"
+        );
+        assert_eq!(
+            public_url,
+            "https://media.viharaos.com/org-1/guests/g-1/thumb.webp"
+        );
     }
 
     // ─── R2 endpoint construction ───

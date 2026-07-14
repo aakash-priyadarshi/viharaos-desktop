@@ -44,7 +44,11 @@ fn setup_file_logging(app_data_dir: &std::path::Path) {
     {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("Warning: could not open log file {}: {}", log_path.display(), e);
+            eprintln!(
+                "Warning: could not open log file {}: {}",
+                log_path.display(),
+                e
+            );
             return;
         }
     };
@@ -100,10 +104,7 @@ fn install_panic_hook() {
             #[cfg(target_os = "windows")]
             {
                 use std::process::Command;
-                let _ = Command::new("msg")
-                    .arg("*")
-                    .arg(&full_msg)
-                    .spawn();
+                let _ = Command::new("msg").arg("*").arg(&full_msg).spawn();
             }
             #[cfg(target_os = "macos")]
             {
@@ -167,13 +168,10 @@ pub fn run() {
     builder
         .setup(|app| {
             // Resolve data directories — use graceful error handling, not .expect()
-            let app_data_dir = app
-                .path()
-                .app_data_dir()
-                .map_err(|e| {
-                    log::error!("Failed to resolve app data directory: {}", e);
-                    e.to_string()
-                })?;
+            let app_data_dir = app.path().app_data_dir().map_err(|e| {
+                log::error!("Failed to resolve app data directory: {}", e);
+                e.to_string()
+            })?;
             let images_dir = app_data_dir.join("images");
 
             // Set up file logging now that we know the app data dir
@@ -194,8 +192,14 @@ pub fn run() {
 
             // Create subfolders for each entity type
             for folder in &[
-                "menu-items", "guests", "employees", "rooms",
-                "lost-found", "transport", "visitors", "properties",
+                "menu-items",
+                "guests",
+                "employees",
+                "rooms",
+                "lost-found",
+                "transport",
+                "visitors",
+                "properties",
             ] {
                 let path = images_dir.join(folder);
                 if let Err(e) = std::fs::create_dir_all(&path) {
@@ -241,7 +245,11 @@ pub fn run() {
             // tasks automatically — a panic here won't crash the entire app.
             let sync_state = state.clone();
             tauri::async_runtime::spawn(async move {
-                sync_state.sync.clone().start_worker(sync_state.clone()).await;
+                sync_state
+                    .sync
+                    .clone()
+                    .start_worker(sync_state.clone())
+                    .await;
             });
 
             app.manage(state);

@@ -1,26 +1,26 @@
-use std::sync::Arc;
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+use axum::http::HeaderValue;
 use axum::{
-    routing::{any, get, post, put, delete},
-    Router,
     body::Body,
-    extract::{Request, State as AxumState, Path, Query},
-    response::Json,
+    extract::{Path, Query, Request, State as AxumState},
     http::StatusCode,
+    response::Json,
+    routing::{any, delete, get, post, put},
+    Router,
 };
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Sha256, Digest};
-use tower_http::cors::{CorsLayer, Any, AllowOrigin};
-use axum::http::HeaderValue;
-use argon2::{
-    Argon2,
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
-};
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use crate::AppState;
-use crate::commands::auth::{CloudUser, get_server_url, store_cloud_session};
+use crate::commands::auth::{get_server_url, store_cloud_session, CloudUser};
 use crate::db::models::*;
+use crate::AppState;
 
 /// Hash a password with Argon2id for offline verification.
 /// Argon2id is the recommended password hashing algorithm (OWASP, PHC).
@@ -73,15 +73,22 @@ fn is_legacy_hash(stored_hash: &str) -> bool {
 /// (e.g. SQL errors, file paths) in HTTP responses.
 fn internal_error<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     log::error!("Internal error: {}", e);
-    (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error".to_string(),
+    )
 }
 
 /// Verify that a joined path stays within the allowed base directory.
 /// Prevents path traversal attacks (e.g., `/images/../../etc/passwd`).
 fn safe_join(base: &std::path::Path, relative: &str) -> Result<std::path::PathBuf, String> {
     let joined = base.join(relative);
-    let canonical_base = base.canonicalize().map_err(|e| format!("Invalid base dir: {}", e))?;
-    let canonical_joined = joined.canonicalize().map_err(|_| "Path not found".to_string())?;
+    let canonical_base = base
+        .canonicalize()
+        .map_err(|e| format!("Invalid base dir: {}", e))?;
+    let canonical_joined = joined
+        .canonicalize()
+        .map_err(|_| "Path not found".to_string())?;
     if !canonical_joined.starts_with(&canonical_base) {
         return Err("Path traversal denied".to_string());
     }
@@ -110,8 +117,40 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
     }
 }
 
+/// Return true for routes that are intentionally public or use their own token
+/// handling (e.g., the guest portal and passkey login).
+fn is_public_path(path: &str) -> bool {
+    if path.starts_with("/api/") {
+        let sub = &path["/api/".len()..];
+        sub == "health"
+            || sub == "auth/login"
+            || sub == "auth/refresh"
+            || sub.starts_with("auth/invite/")
+            || sub.starts_with("auth/google")
+            || sub.starts_with("auth/availability/email")
+            || sub.starts_with("auth/passkey/login-")
+            || sub.starts_with("auth/device/")
+            || sub.starts_with("guests/portal")
+            || sub.starts_with("guests/passport")
+            || sub.starts_with("concierge/room/")
+            || sub.starts_with("forex/")
+            || sub.starts_with("pricing/")
+            || sub.starts_with("public/")
+            || sub.starts_with("analytics/track")
+            || sub.starts_with("desktop/releases")
+            || sub.starts_with("subscriptions/webhook/")
+            || sub == "properties/resolve-host"
+            || sub == "ai/marketing"
+            || sub == "ai/concierge"
+            || sub == "ai/debug"
+    } else {
+        path.starts_with("/images/")
+    }
+}
+
 /// Axum middleware that validates the Bearer token against the session_token table.
-/// Requests to /api/auth/login and /api/health are exempt (no auth required).
+/// Public routes (e.g., login, guest portal, image serving) are allowed through
+/// without a token so the catch-all proxy can forward them to the cloud API.
 async fn auth_middleware(
     AxumState(state): AxumState<Arc<AppState>>,
     request: axum::extract::Request,
@@ -119,22 +158,21 @@ async fn auth_middleware(
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     let path = request.uri().path();
 
-    // Exempt routes that don't require authentication:
-    // - /api/health: health check (no sensitive data)
-    // - /api/auth/login: login endpoint (issues tokens)
-    // - /api/auth/refresh: refresh endpoint (uses refresh token, not access token)
-    // - /images/: static image serving (loaded via <img> tags without auth headers;
-    //   CORS restriction already prevents other origins from accessing these)
-    if path == "/api/health" || path == "/api/auth/login" || path == "/api/auth/refresh" || path.starts_with("/api/guests/portal") || path.starts_with("/images/") {
+    if is_public_path(path) {
         return Ok(next.run(request).await);
     }
 
     // Extract and validate the Bearer token
-    let token = extract_bearer_token(request.headers())
-        .ok_or((StatusCode::UNAUTHORIZED, "Missing or invalid Authorization header".to_string()))?;
+    let token = extract_bearer_token(request.headers()).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "Missing or invalid Authorization header".to_string(),
+    ))?;
 
     let conn = state.db.conn().map_err(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "Database unavailable".to_string())
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Database unavailable".to_string(),
+        )
     })?;
 
     let valid: bool = conn
@@ -146,7 +184,10 @@ async fn auth_middleware(
         .unwrap_or(false);
 
     if !valid {
-        return Err((StatusCode::UNAUTHORIZED, "Invalid or expired session token".to_string()));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid or expired session token".to_string(),
+        ));
     }
 
     Ok(next.run(request).await)
@@ -170,7 +211,12 @@ pub async fn start_server(state: Arc<AppState>) -> Result<(), String> {
 
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
-        .map_err(|e| format!("Failed to bind port {}: {}. Ensure no other application is using this port.", port, e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to bind port {}: {}. Ensure no other application is using this port.",
+                port, e
+            )
+        })?;
 
     axum::serve(listener, app)
         .await
@@ -181,8 +227,10 @@ pub async fn start_server(state: Arc<AppState>) -> Result<(), String> {
 
 /// Forward a request to the cloud API.
 /// Used by the local server for routes that are not implemented locally
-/// (e.g., the guest portal). If a local session token is present, it is
-/// swapped for the cloud JWT stored on the user record.
+/// (e.g., the guest portal, reporting, HR, etc.). If a local session token is
+/// present, it is swapped for the cloud JWT stored on the user record; otherwise
+/// the incoming Authorization header (guest token, custom session token, etc.) is
+/// forwarded as-is.
 async fn proxy_to_cloud(
     AxumState(state): AxumState<Arc<AppState>>,
     req: Request,
@@ -191,12 +239,20 @@ async fn proxy_to_cloud(
     let server_url = get_server_url(&state);
     let incoming_path = parts.uri.path();
     let cloud_path = incoming_path.strip_prefix("/api").unwrap_or(incoming_path);
-    let mut url = format!("{}{}", server_url.trim_end_matches('/'), cloud_path);
+    let mut url = format!(
+        "{}/{}",
+        server_url.trim_end_matches('/'),
+        cloud_path.trim_start_matches('/')
+    );
     if let Some(query) = parts.uri.query() {
         url = format!("{}?{}", url, query);
     }
 
-    let body_bytes = body.collect().await.map_err(|e| internal_error(e.to_string()))?.to_bytes();
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|e| internal_error(e.to_string()))?
+        .to_bytes();
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -204,8 +260,9 @@ async fn proxy_to_cloud(
         .map_err(|e| internal_error(e))?;
     let mut request_builder = client.request(parts.method, &url);
 
-    // If the caller supplied a local session token, replace it with the
-    // cloud JWT so the upstream API can authenticate the request.
+    // If the caller supplied a local session token, replace it with the cloud
+    // JWT. If the token is not a local session, forward it unchanged so guest
+    // sessions and custom tokens still work.
     if let Some(local_token) = extract_bearer_token(&parts.headers) {
         let conn = state.db.conn().map_err(|e| internal_error(e))?;
         let cloud_token: Option<String> = conn
@@ -218,22 +275,52 @@ async fn proxy_to_cloud(
             )
             .ok();
         if let Some(token) = cloud_token {
-            request_builder = request_builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token));
+            request_builder =
+                request_builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token));
+        } else if let Some(auth) = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .cloned()
+        {
+            request_builder = request_builder.header(reqwest::header::AUTHORIZATION, auth);
         }
     }
 
+    // Forward a small, safe subset of headers. Avoid copying hop-by-hop headers
+    // (Host, Connection) and CORS headers that CorsLayer will set locally.
     if let Some(content_type) = parts.headers.get(axum::http::header::CONTENT_TYPE).cloned() {
         request_builder = request_builder.header(reqwest::header::CONTENT_TYPE, content_type);
+    }
+    if let Some(origin) = parts.headers.get(axum::http::header::ORIGIN).cloned() {
+        request_builder = request_builder.header(reqwest::header::ORIGIN, origin);
+    }
+    if let Some(referer) = parts.headers.get(axum::http::header::REFERER).cloned() {
+        request_builder = request_builder.header(reqwest::header::REFERER, referer);
+    }
+    if let Some(accept) = parts.headers.get(axum::http::header::ACCEPT).cloned() {
+        request_builder = request_builder.header(reqwest::header::ACCEPT, accept);
+    }
+    if let Some(user_agent) = parts.headers.get(axum::http::header::USER_AGENT).cloned() {
+        request_builder = request_builder.header(reqwest::header::USER_AGENT, user_agent);
+    } else {
+        request_builder =
+            request_builder.header(reqwest::header::USER_AGENT, "ViharaOS-Desktop/0.2.1");
     }
 
     if !body_bytes.is_empty() {
         request_builder = request_builder.body(body_bytes);
     }
 
-    let cloud_response = request_builder.send().await.map_err(|e| internal_error(e))?;
+    let cloud_response = request_builder
+        .send()
+        .await
+        .map_err(|e| internal_error(e))?;
     let status = cloud_response.status();
     let cloud_headers = cloud_response.headers().clone();
-    let cloud_bytes = cloud_response.bytes().await.map_err(|e| internal_error(e))?;
+    let cloud_bytes = cloud_response
+        .bytes()
+        .await
+        .map_err(|e| internal_error(e))?;
 
     let mut builder = axum::response::Response::builder();
     builder = builder.status(status);
@@ -242,6 +329,11 @@ async fn proxy_to_cloud(
         if name.eq_ignore_ascii_case("content-encoding")
             || name.eq_ignore_ascii_case("transfer-encoding")
             || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("access-control-allow-origin")
+            || name.eq_ignore_ascii_case("access-control-allow-credentials")
+            || name.eq_ignore_ascii_case("access-control-allow-methods")
+            || name.eq_ignore_ascii_case("access-control-allow-headers")
+            || name.eq_ignore_ascii_case("access-control-expose-headers")
         {
             continue;
         }
@@ -263,23 +355,56 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/me", get(auth_me))
         .route("/api/auth/refresh", post(auth_refresh))
-        // Guest portal (proxied to cloud — desktop local DB does not store guest portal state)
+        // Public/guest portal (proxied to cloud — local DB does not store this state)
         .route("/api/guests/portal/*rest", any(proxy_to_cloud))
+        // Cloud-only rooms endpoints (must come before /api/rooms/:id so matchit
+        // does not capture them as a room id)
+        .route("/api/rooms/availability", any(proxy_to_cloud))
+        .route("/api/rooms/types/*rest", any(proxy_to_cloud))
+        .route("/api/rooms/rate-plans/*rest", any(proxy_to_cloud))
+        // Cloud-only reservations endpoints (must come before /api/reservations/:id)
+        .route("/api/reservations/arrivals", any(proxy_to_cloud))
+        .route("/api/reservations/departures", any(proxy_to_cloud))
+        .route("/api/reservations/in-house", any(proxy_to_cloud))
         // Guests
         .route("/api/guests", get(list_guests).post(create_guest))
-        .route("/api/guests/:id", get(get_guest).put(update_guest).delete(delete_guest))
+        .route(
+            "/api/guests/:id",
+            get(get_guest)
+                .put(update_guest)
+                .patch(update_guest)
+                .delete(delete_guest),
+        )
         // Rooms
-        .route("/api/rooms", get(list_rooms))
-        .route("/api/rooms/:id", get(get_room).put(update_room))
+        .route("/api/rooms", get(list_rooms).post(create_room))
+        .route(
+            "/api/rooms/:id",
+            get(get_room)
+                .post(update_room)
+                .put(update_room)
+                .delete(delete_room),
+        )
         .route("/api/rooms/:id/status", put(update_room_status))
         // Reservations
-        .route("/api/reservations", get(list_reservations).post(create_reservation))
-        .route("/api/reservations/:id", get(get_reservation).put(update_reservation).delete(delete_reservation))
+        .route(
+            "/api/reservations",
+            get(list_reservations).post(create_reservation),
+        )
+        .route(
+            "/api/reservations/:id",
+            get(get_reservation)
+                .put(update_reservation)
+                .patch(update_reservation)
+                .delete(delete_reservation),
+        )
         .route("/api/reservations/:id/check-in", post(check_in))
         .route("/api/reservations/:id/check-out", post(check_out))
         // Menu items
         .route("/api/menu-items", get(list_menu_items))
-        .route("/api/menu-items/:id", get(get_menu_item).put(update_menu_item))
+        .route(
+            "/api/menu-items/:id",
+            get(get_menu_item).put(update_menu_item),
+        )
         // POS orders
         .route("/api/pos/orders", get(list_orders).post(create_order))
         .route("/api/pos/orders/:id", get(get_order).put(update_order))
@@ -290,7 +415,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/folios/:id/charges", post(add_folio_charge))
         .route("/api/folios/:id/payments", post(add_folio_payment))
         // Housekeeping
-        .route("/api/housekeeping/tasks", get(list_hk_tasks).post(create_hk_task))
+        .route(
+            "/api/housekeeping/tasks",
+            get(list_hk_tasks).post(create_hk_task),
+        )
         .route("/api/housekeeping/tasks/:id", put(update_hk_task))
         // Media
         .route("/api/media/quota", get(get_storage_quota))
@@ -300,25 +428,26 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sync/trigger", post(trigger_sync))
         // Static image serving (local filesystem)
         .route("/images/*path", get(serve_image))
+        // Catch-all: anything not implemented locally is forwarded to the cloud
+        .fallback(any(proxy_to_cloud))
         .with_state(state)
         // Auth middleware: validates Bearer token against session_token table
-        // for all routes except /api/health and /api/auth/login.
-        .layer(axum::middleware::from_fn_with_state(auth_state, auth_middleware))
+        // for all non-public routes.
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            auth_middleware,
+        ))
         // CORS: restrict to the Tauri webview origin and localhost dev server.
-        // Without this, any web page in the user's browser can read local API
-        // responses from http://127.0.0.1:14000, leaking hotel data.
-        // Use AllowOrigin::list() instead of chained allow_origin() calls —
-        // chained calls on CorsLayer overwrite (each call replaces the previous
-        // value), so only the last origin would be allowed. list() sets all
-        // origins in a single call.
-        .layer(CorsLayer::new()
-            .allow_origin(AllowOrigin::list([
-                "tauri://localhost".parse::<HeaderValue>().unwrap(),
-                "http://tauri.localhost".parse::<HeaderValue>().unwrap(),
-                "http://localhost:3000".parse::<HeaderValue>().unwrap(),
-            ]))
-            .allow_methods(Any)
-            .allow_headers(Any))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list([
+                    "tauri://localhost".parse::<HeaderValue>().unwrap(),
+                    "http://tauri.localhost".parse::<HeaderValue>().unwrap(),
+                    "http://localhost:3000".parse::<HeaderValue>().unwrap(),
+                ]))
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
 }
 
 // ─── Handlers ───
@@ -364,12 +493,20 @@ async fn try_cloud_login(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create HTTP client: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create HTTP client: {}", e),
+            )
+        })?;
 
     let mut body = serde_json::Map::new();
     body.insert("email".to_string(), json!(&req.email));
     body.insert("password".to_string(), json!(&req.password));
-    body.insert("rememberMe".to_string(), json!(req.remember_me.unwrap_or(false)));
+    body.insert(
+        "rememberMe".to_string(),
+        json!(req.remember_me.unwrap_or(false)),
+    );
     if let Some(totp) = &req.totp {
         body.insert("totp".to_string(), json!(totp));
     }
@@ -385,7 +522,10 @@ async fn try_cloud_login(
     {
         Ok(response) => response,
         Err(e) => {
-            log::warn!("Cloud login unavailable, falling back to offline auth: {}", e);
+            log::warn!(
+                "Cloud login unavailable, falling back to offline auth: {}",
+                e
+            );
             return Ok(None);
         }
     };
@@ -397,34 +537,34 @@ async fn try_cloud_login(
         return Err((axum_status, body));
     }
 
-    let cloud: CloudLoginResponse = response
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Cloud login response was invalid: {}", e)))?;
+    let cloud: CloudLoginResponse = response.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Cloud login response was invalid: {}", e),
+        )
+    })?;
 
     if cloud.two_factor_required.unwrap_or(false) {
         return Ok(Some(Json(json!({ "twoFactorRequired": true }))));
     }
 
-    let access_token = cloud
-        .access_token
-        .ok_or((StatusCode::BAD_GATEWAY, "Cloud login response missing access token".to_string()))?;
-    let refresh_token = cloud
-        .refresh_token
-        .ok_or((StatusCode::BAD_GATEWAY, "Cloud login response missing refresh token".to_string()))?;
-    let user = cloud
-        .user
-        .ok_or((StatusCode::BAD_GATEWAY, "Cloud login response missing user".to_string()))?;
+    let access_token = cloud.access_token.ok_or((
+        StatusCode::BAD_GATEWAY,
+        "Cloud login response missing access token".to_string(),
+    ))?;
+    let refresh_token = cloud.refresh_token.ok_or((
+        StatusCode::BAD_GATEWAY,
+        "Cloud login response missing refresh token".to_string(),
+    ))?;
+    let user = cloud.user.ok_or((
+        StatusCode::BAD_GATEWAY,
+        "Cloud login response missing user".to_string(),
+    ))?;
     let remember_me = req.remember_me.unwrap_or(false);
 
-    let session_token = store_cloud_session(
-        state,
-        &user,
-        &access_token,
-        &refresh_token,
-        remember_me,
-    )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let session_token =
+        store_cloud_session(state, &user, &access_token, &refresh_token, remember_me)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let conn = state
         .db
@@ -453,23 +593,36 @@ async fn auth_login(
     }
 
     let conn = state.db.conn().map_err(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "Database unavailable".to_string())
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Database unavailable".to_string(),
+        )
     })?;
 
-    let user: Option<(String, String, String, String, Option<String>, Option<String>, Option<String>)> = conn
+    let user: Option<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = conn
         .query_row(
             "SELECT id, email, name, role, organization_id, property_id, password_hash
              FROM user WHERE email = ?1 AND is_active = 1",
             rusqlite::params![&req.email],
-            |row| Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-            )),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
         )
         .ok();
 
@@ -480,10 +633,7 @@ async fn auth_login(
             // device yet — reject offline login to prevent auth bypass.
             if let Some(ref stored_hash) = password_hash {
                 if !verify_password(&req.password, stored_hash) {
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        "Invalid credentials".to_string(),
-                    ));
+                    return Err((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()));
                 }
                 // Upgrade legacy SHA-256 hashes to Argon2id on successful login
                 if is_legacy_hash(stored_hash) {
@@ -492,7 +642,10 @@ async fn auth_login(
                         "UPDATE user SET password_hash = ?1 WHERE id = ?2",
                         rusqlite::params![new_hash, &id],
                     );
-                    log::info!("Upgraded password hash from SHA-256 to Argon2id for user '{}'", email);
+                    log::info!(
+                        "Upgraded password hash from SHA-256 to Argon2id for user '{}'",
+                        email
+                    );
                 }
             } else {
                 // No password hash stored — can't verify offline
@@ -510,7 +663,11 @@ async fn auth_login(
 
             // Generate a session token and store it for API auth
             let token = format!("offline-token-{}", uuid::Uuid::new_v4());
-            let session_ttl = if req.remember_me.unwrap_or(false) { "+15 days" } else { "+7 days" };
+            let session_ttl = if req.remember_me.unwrap_or(false) {
+                "+15 days"
+            } else {
+                "+7 days"
+            };
             let _ = conn.execute(
                 "INSERT INTO session_token (token, user_id, expires_at) VALUES (?1, ?2, datetime('now', ?3))",
                 rusqlite::params![&token, &id, session_ttl],
@@ -538,10 +695,7 @@ async fn auth_login(
                 }
             })))
         }
-        None => Err((
-            StatusCode::UNAUTHORIZED,
-            "Invalid credentials".to_string(),
-        )),
+        None => Err((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string())),
     }
 }
 
@@ -550,12 +704,12 @@ async fn auth_me(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     // Validate the Authorization header against the session_token table
-    let token = extract_bearer_token(&headers)
-        .ok_or((StatusCode::UNAUTHORIZED, "Missing or invalid Authorization header".to_string()))?;
+    let token = extract_bearer_token(&headers).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "Missing or invalid Authorization header".to_string(),
+    ))?;
 
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let user = conn
         .query_row(
@@ -564,17 +718,19 @@ async fn auth_me(
              JOIN user u ON u.id = st.user_id
              WHERE st.token = ?1 AND st.expires_at > datetime('now') AND u.is_active = 1",
             rusqlite::params![token],
-            |row| Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "email": row.get::<_, String>(1)?,
-                "name": row.get::<_, String>(2)?,
-                "role": row.get::<_, String>(3)?,
-                "organizationId": row.get::<_, Option<String>>(4)?,
-                "propertyId": row.get::<_, Option<String>>(5)?,
-                "isPlatformAdmin": false,
-                "canManageStaff": false,
-                "managedHotelIds": [],
-            })),
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "email": row.get::<_, String>(1)?,
+                    "name": row.get::<_, String>(2)?,
+                    "role": row.get::<_, String>(3)?,
+                    "organizationId": row.get::<_, Option<String>>(4)?,
+                    "propertyId": row.get::<_, Option<String>>(5)?,
+                    "isPlatformAdmin": false,
+                    "canManageStaff": false,
+                    "managedHotelIds": [],
+                }))
+            },
         )
         .ok();
 
@@ -588,9 +744,7 @@ async fn auth_refresh(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(req): Json<RefreshRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let user_id: Option<String> = conn
         .query_row(
@@ -608,7 +762,10 @@ async fn auth_refresh(
         .ok();
 
     let Some(user_id) = user_id else {
-        return Err((StatusCode::UNAUTHORIZED, "Invalid refresh token".to_string()));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid refresh token".to_string(),
+        ));
     };
 
     let token = format!("offline-token-{}", uuid::Uuid::new_v4());
@@ -623,7 +780,9 @@ async fn auth_refresh(
         [],
     );
 
-    Ok(Json(json!({ "accessToken": token.clone(), "refreshToken": token })))
+    Ok(Json(
+        json!({ "accessToken": token.clone(), "refreshToken": token }),
+    ))
 }
 
 // ─── Guests ───
@@ -644,9 +803,7 @@ async fn list_guests(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let limit = q.limit.unwrap_or(50).min(200);
     let offset = q.offset.unwrap_or(0);
@@ -654,7 +811,12 @@ async fn list_guests(
     // Escape LIKE wildcard characters (% and _) in the search term so that
     // user input is treated as a literal substring, not a wildcard pattern.
     // The backslash is used as the ESCAPE character in the SQL below.
-    let search = q.search.unwrap_or_default().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let search = q
+        .search
+        .unwrap_or_default()
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
 
     let mut stmt = conn
         .prepare(
@@ -702,9 +864,7 @@ async fn create_guest(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     conn.execute(
         "INSERT INTO guest (id, property_id, first_name, last_name, email, phone, id_type, id_number, nationality, notes)
@@ -734,9 +894,7 @@ async fn get_guest(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let guest = conn
         .query_row(
@@ -787,12 +945,9 @@ async fn update_guest(
     Path(id): Path<String>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
-    // Dynamic update — build SET clause from provided fields
-    // For safety, only update known fields
+    // Dynamic update — only update known fields when present
     if let Some(name) = req["firstName"].as_str() {
         conn.execute(
             "UPDATE guest SET first_name = ?1, local_updated_at = datetime('now') WHERE id = ?2",
@@ -821,6 +976,104 @@ async fn update_guest(
         )
         .map_err(|e| internal_error(e))?;
     }
+    if let Some(id_type) = req["idType"].as_str() {
+        conn.execute(
+            "UPDATE guest SET id_type = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![id_type, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(id_number) = req["idNumber"].as_str() {
+        conn.execute(
+            "UPDATE guest SET id_number = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![id_number, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(nationality) = req["nationality"].as_str() {
+        conn.execute(
+            "UPDATE guest SET nationality = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![nationality, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(date_of_birth) = req["dateOfBirth"].as_str() {
+        conn.execute(
+            "UPDATE guest SET date_of_birth = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![date_of_birth, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(gender) = req["gender"].as_str() {
+        conn.execute(
+            "UPDATE guest SET gender = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![gender, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(address) = req["address"].as_str() {
+        conn.execute(
+            "UPDATE guest SET address = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![address, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(city) = req["city"].as_str() {
+        conn.execute(
+            "UPDATE guest SET city = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![city, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(state) = req["state"].as_str() {
+        conn.execute(
+            "UPDATE guest SET state = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![state, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(country) = req["country"].as_str() {
+        conn.execute(
+            "UPDATE guest SET country = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![country, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(pincode) = req["pincode"].as_str() {
+        conn.execute(
+            "UPDATE guest SET pincode = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![pincode, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(notes) = req["notes"].as_str() {
+        conn.execute(
+            "UPDATE guest SET notes = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![notes, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(vip) = req["vip"].as_bool() {
+        conn.execute(
+            "UPDATE guest SET vip = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![if vip { 1 } else { 0 }, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(blacklisted) = req["blacklisted"].as_bool() {
+        conn.execute(
+            "UPDATE guest SET blacklisted = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![if blacklisted { 1 } else { 0 }, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(loyalty_points) = req["loyaltyPoints"].as_i64() {
+        conn.execute(
+            "UPDATE guest SET loyalty_points = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![loyalty_points, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
 
     queue_sync(&conn, "guest", &id, "UPDATE", &req)?;
 
@@ -831,9 +1084,7 @@ async fn delete_guest(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     conn.execute("DELETE FROM guest WHERE id = ?1", rusqlite::params![id])
         .map_err(|e| internal_error(e))?;
@@ -849,9 +1100,7 @@ async fn list_rooms(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let property_id = q.property_id.unwrap_or_default();
     let mut stmt = conn
@@ -883,13 +1132,46 @@ async fn list_rooms(
     Ok(Json(json!({ "data": rooms, "count": rooms.len() })))
 }
 
+async fn create_room(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
+
+    let property_id = req["propertyId"].as_str().unwrap_or("");
+    let room_type_id = req["roomTypeId"].as_str();
+    let number = req["number"].as_str().unwrap_or("");
+    let floor = req["floor"].as_i64().unwrap_or(0) as i32;
+    let status = req["status"].as_str().unwrap_or("AVAILABLE");
+    let is_active = req["isActive"].as_bool().unwrap_or(true);
+    let photos = req["photos"].as_str();
+    let notes = req["notes"].as_str();
+
+    // Ensure the referenced room type exists locally so the room FK does not fail
+    if let Some(rt_id) = room_type_id {
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO room_type (id, property_id, name) VALUES (?1, ?2, 'Unknown')",
+            rusqlite::params![rt_id, property_id],
+        );
+    }
+
+    conn.execute(
+        "INSERT INTO room (id, property_id, room_type_id, number, floor, status, is_active, photos, notes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![id, property_id, room_type_id, number, floor, status, if is_active { 1 } else { 0 }, photos, notes],
+    )
+    .map_err(|e| internal_error(e))?;
+
+    queue_sync(&conn, "room", &id, "CREATE", &req)?;
+    Ok(Json(merge_json(req, &[("id", json!(id))])))
+}
+
 async fn get_room(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let room = conn
         .query_row(
@@ -923,10 +1205,63 @@ async fn update_room(
     Path(id): Path<String>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
+    if let Some(property_id) = req["propertyId"].as_str() {
+        conn.execute(
+            "UPDATE room SET property_id = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![property_id, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(room_type_id) = req["roomTypeId"].as_str() {
+        // Ensure the referenced room type exists locally so the FK does not fail
+        let property_id = req["propertyId"].as_str().unwrap_or_default();
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO room_type (id, property_id, name) VALUES (?1, ?2, 'Unknown')",
+            rusqlite::params![room_type_id, property_id],
+        );
+        conn.execute(
+            "UPDATE room SET room_type_id = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![room_type_id, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(number) = req["number"].as_str() {
+        conn.execute(
+            "UPDATE room SET number = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![number, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(floor) = req["floor"].as_i64() {
+        conn.execute(
+            "UPDATE room SET floor = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![floor as i32, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(status) = req["status"].as_str() {
+        conn.execute(
+            "UPDATE room SET status = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![status, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(is_active) = req["isActive"].as_bool() {
+        conn.execute(
+            "UPDATE room SET is_active = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![if is_active { 1 } else { 0 }, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(photos) = req["photos"].as_str() {
+        conn.execute(
+            "UPDATE room SET photos = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![photos, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
     if let Some(notes) = req["notes"].as_str() {
         conn.execute(
             "UPDATE room SET notes = ?1, local_updated_at = datetime('now') WHERE id = ?2",
@@ -939,19 +1274,29 @@ async fn update_room(
     Ok(Json(json!({ "id": id, "updated": true })))
 }
 
+async fn delete_room(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
+
+    conn.execute("DELETE FROM room WHERE id = ?1", rusqlite::params![id])
+        .map_err(|e| internal_error(e))?;
+
+    queue_sync(&conn, "room", &id, "DELETE", &json!({}))?;
+    Ok(Json(json!({ "id": id, "deleted": true })))
+}
+
 async fn update_room_status(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let status = req["status"].as_str().ok_or((
-        StatusCode::BAD_REQUEST,
-        "Missing status field".to_string(),
-    ))?;
+    let status = req["status"]
+        .as_str()
+        .ok_or((StatusCode::BAD_REQUEST, "Missing status field".to_string()))?;
 
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     conn.execute(
         "UPDATE room SET status = ?1, local_updated_at = datetime('now') WHERE id = ?2",
@@ -969,9 +1314,7 @@ async fn list_reservations(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let property_id = q.property_id.unwrap_or_default();
     let mut stmt = conn
@@ -1019,7 +1362,9 @@ async fn list_reservations(
         .map_err(|e| internal_error(e))?;
 
     let reservations: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
-    Ok(Json(json!({ "data": reservations, "count": reservations.len() })))
+    Ok(Json(
+        json!({ "data": reservations, "count": reservations.len() }),
+    ))
 }
 
 async fn create_reservation(
@@ -1027,9 +1372,17 @@ async fn create_reservation(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
+
+    let check_in = req["checkInDate"]
+        .as_str()
+        .or(req["checkIn"].as_str())
+        .unwrap_or("");
+    let check_out = req["checkOutDate"]
+        .as_str()
+        .or(req["checkOut"].as_str())
+        .unwrap_or("");
+    let special_requests = req["specialRequests"].as_str().or(req["notes"].as_str());
 
     conn.execute(
         "INSERT INTO reservation (id, property_id, guest_id, room_id, room_type_id, status, source, check_in_date, check_out_date, adults, children, rate_amount, currency, special_requests, created_by)
@@ -1042,13 +1395,13 @@ async fn create_reservation(
             req["roomTypeId"].as_str(),
             req["status"].as_str().unwrap_or("CONFIRMED"),
             req["source"].as_str(),
-            req["checkInDate"].as_str().unwrap_or(""),
-            req["checkOutDate"].as_str().unwrap_or(""),
+            check_in,
+            check_out,
             req["adults"].as_i64().unwrap_or(1),
             req["children"].as_i64().unwrap_or(0),
             req["rateAmount"].as_f64().unwrap_or(0.0),
             req["currency"].as_str().unwrap_or("INR"),
-            req["specialRequests"].as_str(),
+            special_requests,
             req["createdBy"].as_str(),
         ],
     )
@@ -1062,9 +1415,7 @@ async fn get_reservation(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let res = conn
         .query_row(
@@ -1108,9 +1459,7 @@ async fn update_reservation(
     Path(id): Path<String>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     if let Some(status) = req["status"].as_str() {
         conn.execute(
@@ -1126,6 +1475,69 @@ async fn update_reservation(
         )
         .map_err(|e| internal_error(e))?;
     }
+    if let Some(room_type_id) = req["roomTypeId"].as_str() {
+        conn.execute(
+            "UPDATE reservation SET room_type_id = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![room_type_id, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(check_in) = req["checkInDate"].as_str().or(req["checkIn"].as_str()) {
+        conn.execute(
+            "UPDATE reservation SET check_in_date = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![check_in, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(check_out) = req["checkOutDate"].as_str().or(req["checkOut"].as_str()) {
+        conn.execute(
+            "UPDATE reservation SET check_out_date = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![check_out, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(adults) = req["adults"].as_i64() {
+        conn.execute(
+            "UPDATE reservation SET adults = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![adults as i32, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(children) = req["children"].as_i64() {
+        conn.execute(
+            "UPDATE reservation SET children = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![children as i32, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(rate_amount) = req["rateAmount"].as_f64() {
+        conn.execute(
+            "UPDATE reservation SET rate_amount = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![rate_amount, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(currency) = req["currency"].as_str() {
+        conn.execute(
+            "UPDATE reservation SET currency = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![currency, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(special_requests) = req["specialRequests"].as_str().or(req["notes"].as_str()) {
+        conn.execute(
+            "UPDATE reservation SET special_requests = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![special_requests, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
+    if let Some(source) = req["source"].as_str() {
+        conn.execute(
+            "UPDATE reservation SET source = ?1, local_updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![source, id],
+        )
+        .map_err(|e| internal_error(e))?;
+    }
 
     queue_sync(&conn, "reservation", &id, "UPDATE", &req)?;
     Ok(Json(json!({ "id": id, "updated": true })))
@@ -1135,12 +1547,13 @@ async fn delete_reservation(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
-    conn.execute("DELETE FROM reservation WHERE id = ?1", rusqlite::params![id])
-        .map_err(|e| internal_error(e))?;
+    conn.execute(
+        "DELETE FROM reservation WHERE id = ?1",
+        rusqlite::params![id],
+    )
+    .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "reservation", &id, "DELETE", &json!({}))?;
     Ok(Json(json!({ "id": id, "deleted": true })))
@@ -1151,9 +1564,7 @@ async fn check_in(
     Path(id): Path<String>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
@@ -1171,8 +1582,16 @@ async fn check_in(
         .map_err(|e| internal_error(e))?;
     }
 
-    queue_sync(&conn, "reservation", &id, "UPDATE", &json!({ "status": "CHECKED_IN", "checkedInAt": now }))?;
-    Ok(Json(json!({ "id": id, "status": "CHECKED_IN", "checkedInAt": now })))
+    queue_sync(
+        &conn,
+        "reservation",
+        &id,
+        "UPDATE",
+        &json!({ "status": "CHECKED_IN", "checkedInAt": now }),
+    )?;
+    Ok(Json(
+        json!({ "id": id, "status": "CHECKED_IN", "checkedInAt": now }),
+    ))
 }
 
 async fn check_out(
@@ -1180,9 +1599,7 @@ async fn check_out(
     Path(id): Path<String>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
@@ -1200,8 +1617,16 @@ async fn check_out(
         .map_err(|e| internal_error(e))?;
     }
 
-    queue_sync(&conn, "reservation", &id, "UPDATE", &json!({ "status": "CHECKED_OUT", "checkedOutAt": now }))?;
-    Ok(Json(json!({ "id": id, "status": "CHECKED_OUT", "checkedOutAt": now })))
+    queue_sync(
+        &conn,
+        "reservation",
+        &id,
+        "UPDATE",
+        &json!({ "status": "CHECKED_OUT", "checkedOutAt": now }),
+    )?;
+    Ok(Json(
+        json!({ "id": id, "status": "CHECKED_OUT", "checkedOutAt": now }),
+    ))
 }
 
 // ─── Menu Items ───
@@ -1210,9 +1635,7 @@ async fn list_menu_items(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let property_id = q.property_id.unwrap_or_default();
     let mut stmt = conn
@@ -1250,9 +1673,7 @@ async fn get_menu_item(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let item = conn
         .query_row(
@@ -1288,9 +1709,7 @@ async fn update_menu_item(
     Path(id): Path<String>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     if let Some(price) = req["price"].as_f64() {
         conn.execute(
@@ -1317,9 +1736,7 @@ async fn list_orders(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let property_id = q.property_id.unwrap_or_default();
     let mut stmt = conn
@@ -1367,9 +1784,7 @@ async fn create_order(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
     let order_number = format!("ORD-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     conn.execute(
         "INSERT INTO pos_order (id, property_id, order_number, table_number, guest_id, reservation_id, status, order_type, total_amount, tax_amount, discount_amount, final_amount, currency, payment_status, served_by)
@@ -1395,16 +1810,17 @@ async fn create_order(
     .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "pos-order", &id, "CREATE", &req)?;
-    Ok(Json(merge_json(req, &[("id", json!(id)), ("orderNumber", json!(order_number))])))
+    Ok(Json(merge_json(
+        req,
+        &[("id", json!(id)), ("orderNumber", json!(order_number))],
+    )))
 }
 
 async fn get_order(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let order = conn
         .query_row(
@@ -1448,9 +1864,7 @@ async fn update_order(
     Path(id): Path<String>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     if let Some(status) = req["status"].as_str() {
         conn.execute(
@@ -1470,9 +1884,7 @@ async fn add_order_item(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     conn.execute(
         "INSERT INTO pos_order_item (id, order_id, menu_item_id, quantity, unit_price, total_price, notes, status)
@@ -1490,7 +1902,10 @@ async fn add_order_item(
     )
     .map_err(|e| internal_error(e))?;
 
-    Ok(Json(merge_json(req, &[("id", json!(id)), ("orderId", json!(order_id))])))
+    Ok(Json(merge_json(
+        req,
+        &[("id", json!(id)), ("orderId", json!(order_id))],
+    )))
 }
 
 // ─── Folios ───
@@ -1499,9 +1914,7 @@ async fn list_folios(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let property_id = q.property_id.unwrap_or_default();
     let mut stmt = conn
@@ -1548,9 +1961,7 @@ async fn create_folio(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
     let folio_number = format!("FOL-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     conn.execute(
         "INSERT INTO folio (id, property_id, reservation_id, guest_id, folio_number, status, currency)
@@ -1567,16 +1978,17 @@ async fn create_folio(
     .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "folio", &id, "CREATE", &req)?;
-    Ok(Json(merge_json(req, &[("id", json!(id)), ("folioNumber", json!(folio_number))])))
+    Ok(Json(merge_json(
+        req,
+        &[("id", json!(id)), ("folioNumber", json!(folio_number))],
+    )))
 }
 
 async fn get_folio(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let folio = conn
         .query_row(
@@ -1615,9 +2027,7 @@ async fn add_folio_charge(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let amount = req["amount"].as_f64().unwrap_or(0.0);
     let tax_rate = req["taxRate"].as_f64().unwrap_or(0.0);
@@ -1653,7 +2063,14 @@ async fn add_folio_charge(
     .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "folio-charge", &id, "CREATE", &req)?;
-    Ok(Json(merge_json(req, &[("id", json!(id)), ("folioId", json!(folio_id)), ("totalAmount", json!(total))])))
+    Ok(Json(merge_json(
+        req,
+        &[
+            ("id", json!(id)),
+            ("folioId", json!(folio_id)),
+            ("totalAmount", json!(total)),
+        ],
+    )))
 }
 
 async fn add_folio_payment(
@@ -1662,9 +2079,7 @@ async fn add_folio_payment(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let amount = req["amount"].as_f64().unwrap_or(0.0);
 
@@ -1694,7 +2109,14 @@ async fn add_folio_payment(
     .map_err(|e| internal_error(e))?;
 
     queue_sync(&conn, "folio-payment", &id, "CREATE", &req)?;
-    Ok(Json(merge_json(req, &[("id", json!(id)), ("folioId", json!(folio_id)), ("amount", json!(amount))])))
+    Ok(Json(merge_json(
+        req,
+        &[
+            ("id", json!(id)),
+            ("folioId", json!(folio_id)),
+            ("amount", json!(amount)),
+        ],
+    )))
 }
 
 // ─── Housekeeping ───
@@ -1703,9 +2125,7 @@ async fn list_hk_tasks(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     let property_id = q.property_id.unwrap_or_default();
     let mut stmt = conn
@@ -1747,9 +2167,7 @@ async fn create_hk_task(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     conn.execute(
         "INSERT INTO housekeeping_task (id, property_id, room_id, task_type, status, assigned_to, priority, notes)
@@ -1776,9 +2194,7 @@ async fn update_hk_task(
     Path(id): Path<String>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     if let Some(status) = req["status"].as_str() {
         let completed_at = if status == "COMPLETED" {
@@ -1804,9 +2220,7 @@ async fn get_storage_quota(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let org_id = q.property_id.unwrap_or_default();
-    let conn = state.db.conn().map_err(|e| {
-        internal_error(e)
-    })?;
+    let conn = state.db.conn().map_err(|e| internal_error(e))?;
 
     // Get or create quota
     let quota = conn
@@ -1814,32 +2228,45 @@ async fn get_storage_quota(
             "SELECT id, organization_id, free_quota_bytes, addon_bytes, used_bytes
              FROM storage_quota WHERE organization_id = ?1",
             rusqlite::params![org_id],
-            |row| Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "organizationId": row.get::<_, String>(1)?,
-                "freeQuotaBytes": row.get::<_, i64>(2)?,
-                "addonBytes": row.get::<_, i64>(3)?,
-                "usedBytes": row.get::<_, i64>(4)?,
-            })),
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "organizationId": row.get::<_, String>(1)?,
+                    "freeQuotaBytes": row.get::<_, i64>(2)?,
+                    "addonBytes": row.get::<_, i64>(3)?,
+                    "usedBytes": row.get::<_, i64>(4)?,
+                }))
+            },
         )
-        .unwrap_or_else(|_| json!({
-            "organizationId": org_id,
-            "freeQuotaBytes": 1073741824_i64,
-            "addonBytes": 0_i64,
-            "usedBytes": 0_i64,
-        }));
+        .unwrap_or_else(|_| {
+            json!({
+                "organizationId": org_id,
+                "freeQuotaBytes": 1073741824_i64,
+                "addonBytes": 0_i64,
+                "usedBytes": 0_i64,
+            })
+        });
 
     // Calculate actual usage
     let actual_used = crate::image::dir_size(&state.images_dir) as i64;
-    let total_quota = quota["freeQuotaBytes"].as_i64().unwrap_or(1073741824) + quota["addonBytes"].as_i64().unwrap_or(0);
-    Ok(Json(merge_json(quota, &[("usedBytes", json!(actual_used)), ("totalQuotaBytes", json!(total_quota))])))
+    let total_quota = quota["freeQuotaBytes"].as_i64().unwrap_or(1073741824)
+        + quota["addonBytes"].as_i64().unwrap_or(0);
+    Ok(Json(merge_json(
+        quota,
+        &[
+            ("usedBytes", json!(actual_used)),
+            ("totalQuotaBytes", json!(total_quota)),
+        ],
+    )))
 }
 
 async fn sync_media(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     // TODO: Trigger actual R2 sync
-    Ok(Json(json!({ "synced": true, "message": "Media sync queued" })))
+    Ok(Json(
+        json!({ "synced": true, "message": "Media sync queued" }),
+    ))
 }
 
 async fn get_sync_status(
@@ -1852,9 +2279,11 @@ async fn get_sync_status(
 async fn trigger_sync(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    state.sync.trigger_sync().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e)
-    })?;
+    state
+        .sync
+        .trigger_sync()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(json!({ "triggered": true })))
 }
 
@@ -1868,8 +2297,12 @@ async fn serve_image(
         Ok(p) => p,
         Err(_) => return Err((StatusCode::NOT_FOUND, "Image not found".to_string())),
     };
-    std::fs::read(&full_path)
-        .map_err(|_,| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read image".to_string()))
+    std::fs::read(&full_path).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to read image".to_string(),
+        )
+    })
 }
 
 // ─── Helper ───
@@ -1882,7 +2315,13 @@ fn queue_sync(
     payload: &Value,
 ) -> Result<(), (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
-    let idempotency_key = format!("{}_{}_{}_{}", entity_type, entity_id, operation, chrono::Utc::now().timestamp());
+    let idempotency_key = format!(
+        "{}_{}_{}_{}",
+        entity_type,
+        entity_id,
+        operation,
+        chrono::Utc::now().timestamp()
+    );
     conn.execute(
         "INSERT OR IGNORE INTO sync_outbox (id, idempotency_key, entity_type, entity_id, operation, payload, device_id, property_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1915,14 +2354,19 @@ pub async fn store_password_hash(
 ) -> Result<(), String> {
     let hash = hash_password(&password);
     let conn = state.db.conn().map_err(|e| e.to_string())?;
-    let affected = conn.execute(
-        "UPDATE user SET password_hash = ?1 WHERE email = ?2",
-        rusqlite::params![hash, email],
-    ).map_err(|e| e.to_string())?;
+    let affected = conn
+        .execute(
+            "UPDATE user SET password_hash = ?1 WHERE email = ?2",
+            rusqlite::params![hash, email],
+        )
+        .map_err(|e| e.to_string())?;
     if affected == 0 {
         // User not found in local DB — they may not be synced yet.
         // This is not an error; the hash will be stored after the next sync.
-        log::debug!("store_password_hash: user '{}' not found in local DB yet", email);
+        log::debug!(
+            "store_password_hash: user '{}' not found in local DB yet",
+            email
+        );
     }
     Ok(())
 }
@@ -1949,19 +2393,28 @@ mod tests {
         // Argon2 uses a random salt, so two hashes of the same password differ.
         let h1 = hash_password("mysecret123");
         let h2 = hash_password("mysecret123");
-        assert_ne!(h1, h2, "same password must produce different hashes (random salt)");
+        assert_ne!(
+            h1, h2,
+            "same password must produce different hashes (random salt)"
+        );
     }
 
     #[test]
     fn verify_password_succeeds_for_correct_password() {
         let hash = hash_password("correct-horse-battery-staple");
-        assert!(verify_password("correct-horse-battery-staple", &hash), "correct password must verify");
+        assert!(
+            verify_password("correct-horse-battery-staple", &hash),
+            "correct password must verify"
+        );
     }
 
     #[test]
     fn verify_password_fails_for_wrong_password() {
         let hash = hash_password("correct-horse-battery-staple");
-        assert!(!verify_password("wrong-password", &hash), "wrong password must not verify");
+        assert!(
+            !verify_password("wrong-password", &hash),
+            "wrong password must not verify"
+        );
     }
 
     #[test]
@@ -1970,19 +2423,31 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(b"legacy-password");
         let legacy_hash = hex::encode(hasher.finalize());
-        assert!(verify_password("legacy-password", &legacy_hash), "legacy SHA-256 hash must verify");
-        assert!(!verify_password("wrong", &legacy_hash), "wrong password must not verify against legacy hash");
+        assert!(
+            verify_password("legacy-password", &legacy_hash),
+            "legacy SHA-256 hash must verify"
+        );
+        assert!(
+            !verify_password("wrong", &legacy_hash),
+            "wrong password must not verify against legacy hash"
+        );
     }
 
     #[test]
     fn is_legacy_hash_detects_sha256_and_argon2() {
         let argon_hash = hash_password("test");
-        assert!(!is_legacy_hash(&argon_hash), "Argon2 hash must not be detected as legacy");
+        assert!(
+            !is_legacy_hash(&argon_hash),
+            "Argon2 hash must not be detected as legacy"
+        );
 
         let mut hasher = Sha256::new();
         hasher.update(b"test");
         let sha_hash = hex::encode(hasher.finalize());
-        assert!(is_legacy_hash(&sha_hash), "SHA-256 hash must be detected as legacy");
+        assert!(
+            is_legacy_hash(&sha_hash),
+            "SHA-256 hash must be detected as legacy"
+        );
     }
 
     // ─── safe_join ───
@@ -1990,8 +2455,8 @@ mod tests {
     fn create_test_base() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("create temp dir");
         // Create a file inside so canonicalize works
-        let mut f = std::fs::File::create(dir.path().join("placeholder.txt"))
-            .expect("create placeholder");
+        let mut f =
+            std::fs::File::create(dir.path().join("placeholder.txt")).expect("create placeholder");
         f.write_all(b"test").expect("write placeholder");
         // Create a subdirectory
         std::fs::create_dir_all(dir.path().join("guests")).expect("create subdir");
@@ -2017,8 +2482,11 @@ mod tests {
         let result = safe_join(base.path(), "../../etc/passwd");
         assert!(result.is_err(), "path traversal with .. must be blocked");
         let err = result.unwrap_err();
-        assert!(err.contains("traversal") || err.contains("not found"),
-            "error should mention traversal or not found, got: {}", err);
+        assert!(
+            err.contains("traversal") || err.contains("not found"),
+            "error should mention traversal or not found, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -2033,9 +2501,16 @@ mod tests {
         let base = create_test_base();
         // On Windows, absolute paths like C:\Windows won't be under the temp dir
         // On Unix, /etc/hosts won't be under the temp dir
-        let outside = if cfg!(windows) { "C:/Windows/System32/drivers/etc/hosts" } else { "/etc/passwd" };
+        let outside = if cfg!(windows) {
+            "C:/Windows/System32/drivers/etc/hosts"
+        } else {
+            "/etc/passwd"
+        };
         let result = safe_join(base.path(), outside);
-        assert!(result.is_err(), "absolute path outside base must be blocked");
+        assert!(
+            result.is_err(),
+            "absolute path outside base must be blocked"
+        );
     }
 
     // ─── merge_json ───
@@ -2054,7 +2529,10 @@ mod tests {
     fn merge_json_overrides_existing_keys() {
         let base = json!({ "name": "Alice", "version": 1 });
         let result = merge_json(base, &[("name", json!("Bob"))]);
-        assert_eq!(result["name"], "Bob", "override should replace existing value");
+        assert_eq!(
+            result["name"], "Bob",
+            "override should replace existing value"
+        );
     }
 
     #[test]

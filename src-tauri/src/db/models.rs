@@ -58,7 +58,7 @@ pub struct Room {
     pub floor: Option<i32>,
     pub status: String,
     pub is_active: bool,
-    pub photos: Option<String>,  // JSON array
+    pub photos: Option<String>, // JSON array
     pub notes: Option<String>,
 }
 

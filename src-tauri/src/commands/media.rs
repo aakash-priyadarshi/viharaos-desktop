@@ -1,16 +1,16 @@
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use chrono::Utc;
 
-use crate::AppState;
-use crate::image::{generate_variants, save_to_file, delete_file, dir_size, ImageError};
 use crate::db::models::StorageQuota;
+use crate::image::{delete_file, dir_size, generate_variants, save_to_file, ImageError};
+use crate::AppState;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SaveImageRequest {
-    pub entity: String,       // menu-items, guests, employees, rooms, etc.
+    pub entity: String, // menu-items, guests, employees, rooms, etc.
     pub entity_id: String,
     pub file_name: String,
     pub file_bytes: Vec<u8>,
@@ -18,8 +18,8 @@ pub struct SaveImageRequest {
     pub organization_id: String,
     pub property_id: String,
     pub uploaded_by: String,
-    pub role: String,         // user role for permission check
-    pub is_always_cloud: bool,  // true for menu items, logo
+    pub role: String,          // user role for permission check
+    pub is_always_cloud: bool, // true for menu items, logo
 }
 
 /// Role-based folder permissions:
@@ -88,12 +88,10 @@ pub async fn save_image_local(
     let entity_dir = images_dir.join(&request.entity);
 
     // Delete old variants for this entity (delete-on-replace)
-    delete_old_variants(&state, &request.entity, &request.entity_id)
-        .map_err(|e| e.to_string())?;
+    delete_old_variants(&state, &request.entity, &request.entity_id).map_err(|e| e.to_string())?;
 
     // Generate image variants
-    let variants = generate_variants(&request.file_bytes)
-        .map_err(|e| e.to_string())?;
+    let variants = generate_variants(&request.file_bytes).map_err(|e| e.to_string())?;
 
     // Generate unique filename
     let timestamp = Utc::now().timestamp();
@@ -152,7 +150,10 @@ pub async fn save_image_local(
 
     // Queue sync outbox entry for cloud upload
     let outbox_id = Uuid::new_v4().to_string();
-    let idempotency_key = format!("media_{}_{}_{}", request.entity, request.entity_id, timestamp);
+    let idempotency_key = format!(
+        "media_{}_{}_{}",
+        request.entity, request.entity_id, timestamp
+    );
     let conn = state.db.conn().map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO sync_outbox (id, idempotency_key, entity_type, entity_id, operation, payload, device_id, property_id)
@@ -212,14 +213,20 @@ pub async fn delete_image_local(
 
     // Try immediate R2 deletion if configured
     if let Some(org) = org_id {
-        if let Err(e) = crate::r2::delete_entity_from_r2(&state.db, &org, &entity, &entity_id).await {
+        if let Err(e) = crate::r2::delete_entity_from_r2(&state.db, &org, &entity, &entity_id).await
+        {
             log::warn!("R2 delete failed (will retry via sync outbox): {}", e);
         }
     }
 
     // Queue sync outbox for R2 deletion (in case immediate delete failed)
     let outbox_id = Uuid::new_v4().to_string();
-    let idempotency_key = format!("media_delete_{}_{}_{}", entity, entity_id, Utc::now().timestamp());
+    let idempotency_key = format!(
+        "media_delete_{}_{}_{}",
+        entity,
+        entity_id,
+        Utc::now().timestamp()
+    );
     let conn = state.db.conn().map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO sync_outbox (id, idempotency_key, entity_type, entity_id, operation, payload, device_id, property_id)
@@ -246,9 +253,12 @@ pub async fn get_local_image_path(
 ) -> Result<String, String> {
     let full_path = state.images_dir.join(&relative_path);
     // Prevent path traversal — canonicalize and verify it's within images_dir
-    let canonical_base = state.images_dir.canonicalize()
+    let canonical_base = state
+        .images_dir
+        .canonicalize()
         .map_err(|e| format!("Invalid images dir: {}", e))?;
-    let canonical_path = full_path.canonicalize()
+    let canonical_path = full_path
+        .canonicalize()
         .map_err(|_| "Image not found locally".to_string())?;
     if !canonical_path.starts_with(&canonical_base) {
         return Err("Image not found locally".to_string());
@@ -270,13 +280,15 @@ pub async fn check_storage_usage(
             "SELECT id, organization_id, free_quota_bytes, addon_bytes, used_bytes
              FROM storage_quota WHERE organization_id = ?1",
             rusqlite::params![organization_id],
-            |row| Ok(StorageQuota {
-                id: row.get(0)?,
-                organization_id: row.get(1)?,
-                free_quota_bytes: row.get(2)?,
-                addon_bytes: row.get(3)?,
-                used_bytes: row.get(4)?,
-            }),
+            |row| {
+                Ok(StorageQuota {
+                    id: row.get(0)?,
+                    organization_id: row.get(1)?,
+                    free_quota_bytes: row.get(2)?,
+                    addon_bytes: row.get(3)?,
+                    used_bytes: row.get(4)?,
+                })
+            },
         )
         .ok();
 
@@ -323,12 +335,8 @@ pub async fn sync_media_to_cloud(
     organization_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<SyncMediaResponse, String> {
-    let (synced_count, total_bytes) = crate::r2::sync_media_to_r2(
-        &state.db,
-        &state.images_dir,
-        &organization_id,
-    )
-    .await?;
+    let (synced_count, total_bytes) =
+        crate::r2::sync_media_to_r2(&state.db, &state.images_dir, &organization_id).await?;
 
     Ok(SyncMediaResponse {
         synced_count,
@@ -348,25 +356,22 @@ fn delete_old_variants(
     entity: &str,
     entity_id: &str,
 ) -> Result<(), ImageError> {
-    let conn = state.db.conn().map_err(|_| ImageError::Save(
-        "DB connection error".to_string()
-    ))?;
+    let conn = state
+        .db
+        .conn()
+        .map_err(|_| ImageError::Save("DB connection error".to_string()))?;
 
     // Get old local paths
     let old_paths: Vec<String> = {
         let mut stmt = conn
-            .prepare(
-                "SELECT local_path FROM media_asset WHERE entity = ?1 AND entity_id = ?2",
-            )
+            .prepare("SELECT local_path FROM media_asset WHERE entity = ?1 AND entity_id = ?2")
             .map_err(|_| ImageError::Save("Query error".to_string()))?;
         let rows = stmt
             .query_map(rusqlite::params![entity, entity_id], |row| {
                 row.get::<_, Option<String>>(0)
             })
             .map_err(|_| ImageError::Save("Query error".to_string()))?;
-        rows.filter_map(|r| r.ok())
-            .filter_map(|p| p)
-            .collect()
+        rows.filter_map(|r| r.ok()).filter_map(|p| p).collect()
     };
 
     // Delete old files from filesystem
@@ -393,25 +398,41 @@ mod tests {
 
     #[test]
     fn platform_admin_can_access_all_folders() {
-        for entity in &["guests", "employees", "menu-items", "rooms", "visitors", "lost-found"] {
-            assert!(check_folder_permission("PLATFORM_ADMIN", entity),
-                "PLATFORM_ADMIN should access '{}'", entity);
+        for entity in &[
+            "guests",
+            "employees",
+            "menu-items",
+            "rooms",
+            "visitors",
+            "lost-found",
+        ] {
+            assert!(
+                check_folder_permission("PLATFORM_ADMIN", entity),
+                "PLATFORM_ADMIN should access '{}'",
+                entity
+            );
         }
     }
 
     #[test]
     fn hotel_admin_can_access_all_folders() {
         for entity in &["guests", "employees", "menu-items", "rooms"] {
-            assert!(check_folder_permission("HOTEL_ADMIN", entity),
-                "HOTEL_ADMIN should access '{}'", entity);
+            assert!(
+                check_folder_permission("HOTEL_ADMIN", entity),
+                "HOTEL_ADMIN should access '{}'",
+                entity
+            );
         }
     }
 
     #[test]
     fn owner_can_access_all_folders() {
         for entity in &["guests", "employees", "menu-items", "rooms"] {
-            assert!(check_folder_permission("OWNER", entity),
-                "OWNER should access '{}'", entity);
+            assert!(
+                check_folder_permission("OWNER", entity),
+                "OWNER should access '{}'",
+                entity
+            );
         }
     }
 
@@ -426,8 +447,10 @@ mod tests {
 
     #[test]
     fn gm_cannot_access_employees() {
-        assert!(!check_folder_permission("GENERAL_MANAGER", "employees"),
-            "GM must not access employees (HR-only)");
+        assert!(
+            !check_folder_permission("GENERAL_MANAGER", "employees"),
+            "GM must not access employees (HR-only)"
+        );
     }
 
     // ─── Receptionist → guests, visitors only ───

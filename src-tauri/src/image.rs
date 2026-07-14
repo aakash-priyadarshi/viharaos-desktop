@@ -1,6 +1,6 @@
+use image::{imageops::FilterType, DynamicImage, ImageFormat, ImageReader};
 use std::io::Cursor;
 use std::path::Path;
-use image::{ImageFormat, ImageReader, DynamicImage, imageops::FilterType};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -99,18 +99,15 @@ fn encode_webp(img: &DynamicImage, quality: u8) -> ImageResult<Vec<u8>> {
 /// Save image bytes to a file path, creating parent directories if needed.
 pub fn save_to_file(bytes: &[u8], path: &Path) -> ImageResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ImageError::Save(e.to_string()))?;
+        std::fs::create_dir_all(parent).map_err(|e| ImageError::Save(e.to_string()))?;
     }
-    std::fs::write(path, bytes)
-        .map_err(|e| ImageError::Save(e.to_string()))
+    std::fs::write(path, bytes).map_err(|e| ImageError::Save(e.to_string()))
 }
 
 /// Delete a file if it exists. Does not error if file doesn't exist.
 pub fn delete_file(path: &Path) -> ImageResult<()> {
     if path.exists() {
-        std::fs::remove_file(path)
-            .map_err(|e| ImageError::Save(e.to_string()))?;
+        std::fs::remove_file(path).map_err(|e| ImageError::Save(e.to_string()))?;
     }
     Ok(())
 }
@@ -123,10 +120,7 @@ pub fn dir_size(path: &Path) -> u64 {
     let mut total: u64 = 0;
     for entry in walkdir::WalkDir::new(path).into_iter().flatten() {
         if entry.file_type().is_file() {
-            total += entry
-                .metadata()
-                .map(|m| m.len())
-                .unwrap_or(0);
+            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
         }
     }
     total
@@ -293,7 +287,10 @@ mod tests {
         let img = DynamicImage::ImageRgba8(image::RgbaImage::new(2000, 1000));
         let resized = resize_to_max(&img, 1024);
         assert_eq!(resized.width(), 1024, "width should be capped at max");
-        assert!(resized.height() <= 1024, "height should maintain aspect ratio");
+        assert!(
+            resized.height() <= 1024,
+            "height should maintain aspect ratio"
+        );
     }
 
     #[test]
@@ -301,7 +298,10 @@ mod tests {
         let img = DynamicImage::ImageRgba8(image::RgbaImage::new(1000, 2000));
         let resized = resize_to_max(&img, 1024);
         assert_eq!(resized.height(), 1024, "height should be capped at max");
-        assert!(resized.width() <= 1024, "width should maintain aspect ratio");
+        assert!(
+            resized.width() <= 1024,
+            "width should maintain aspect ratio"
+        );
     }
 
     // ─── crop_square ───

@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
-use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 
@@ -29,13 +29,21 @@ pub struct DeviceHeartbeat {
 /// Detect the current platform string.
 fn detect_platform() -> String {
     #[cfg(target_os = "windows")]
-    { "windows".to_string() }
+    {
+        "windows".to_string()
+    }
     #[cfg(target_os = "macos")]
-    { "macos".to_string() }
+    {
+        "macos".to_string()
+    }
     #[cfg(target_os = "linux")]
-    { "linux".to_string() }
+    {
+        "linux".to_string()
+    }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    { "unknown".to_string() }
+    {
+        "unknown".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -48,7 +56,11 @@ mod tests {
     fn detect_platform_returns_known_value() {
         let platform = detect_platform();
         let valid = ["windows", "macos", "linux", "unknown"].contains(&platform.as_str());
-        assert!(valid, "detect_platform must return a known value, got: {}", platform);
+        assert!(
+            valid,
+            "detect_platform must return a known value, got: {}",
+            platform
+        );
     }
 
     #[test]
@@ -79,7 +91,10 @@ mod tests {
         let id = get_or_create_device_id(&conn).expect("create device id");
         assert!(!id.is_empty(), "device id must not be empty");
         // Should be a UUID
-        assert!(uuid::Uuid::parse_str(&id).is_ok(), "device id should be a valid UUID");
+        assert!(
+            uuid::Uuid::parse_str(&id).is_ok(),
+            "device id should be a valid UUID"
+        );
     }
 
     #[test]
@@ -102,7 +117,10 @@ mod tests {
             let conn = db.conn().expect("get new connection");
             get_or_create_device_id(&conn).expect("second connection")
         };
-        assert_eq!(id1, id2, "device id must persist across connections from the pool");
+        assert_eq!(
+            id1, id2,
+            "device id must persist across connections from the pool"
+        );
     }
 
     // ─── sync_status determination logic ───
@@ -116,10 +134,15 @@ mod tests {
         let failed_count = 5;
         let pending_count = 10;
 
-        let status = if conflict_count > 0 { "CONFLICT" }
-            else if failed_count > 0 { "FAILED" }
-            else if pending_count > 0 { "PENDING" }
-            else { "SYNCED" };
+        let status = if conflict_count > 0 {
+            "CONFLICT"
+        } else if failed_count > 0 {
+            "FAILED"
+        } else if pending_count > 0 {
+            "PENDING"
+        } else {
+            "SYNCED"
+        };
 
         assert_eq!(status, "CONFLICT", "CONFLICT must take priority");
     }
@@ -130,10 +153,15 @@ mod tests {
         let failed_count = 3;
         let pending_count = 10;
 
-        let status = if conflict_count > 0 { "CONFLICT" }
-            else if failed_count > 0 { "FAILED" }
-            else if pending_count > 0 { "PENDING" }
-            else { "SYNCED" };
+        let status = if conflict_count > 0 {
+            "CONFLICT"
+        } else if failed_count > 0 {
+            "FAILED"
+        } else if pending_count > 0 {
+            "PENDING"
+        } else {
+            "SYNCED"
+        };
 
         assert_eq!(status, "FAILED", "FAILED must take priority over PENDING");
     }
@@ -144,10 +172,15 @@ mod tests {
         let failed_count = 0;
         let pending_count = 5;
 
-        let status = if conflict_count > 0 { "CONFLICT" }
-            else if failed_count > 0 { "FAILED" }
-            else if pending_count > 0 { "PENDING" }
-            else { "SYNCED" };
+        let status = if conflict_count > 0 {
+            "CONFLICT"
+        } else if failed_count > 0 {
+            "FAILED"
+        } else if pending_count > 0 {
+            "PENDING"
+        } else {
+            "SYNCED"
+        };
 
         assert_eq!(status, "PENDING");
     }
@@ -158,10 +191,15 @@ mod tests {
         let failed_count = 0;
         let pending_count = 0;
 
-        let status = if conflict_count > 0 { "CONFLICT" }
-            else if failed_count > 0 { "FAILED" }
-            else if pending_count > 0 { "PENDING" }
-            else { "SYNCED" };
+        let status = if conflict_count > 0 {
+            "CONFLICT"
+        } else if failed_count > 0 {
+            "FAILED"
+        } else if pending_count > 0 {
+            "PENDING"
+        } else {
+            "SYNCED"
+        };
 
         assert_eq!(status, "SYNCED");
     }
@@ -267,7 +305,9 @@ pub async fn get_device_heartbeat(
         .unwrap_or((None, None, None, None));
 
     // Get app version from the Tauri package info — fallback to "unknown"
-    let app_version = option_env!("CARGO_PKG_VERSION").unwrap_or("0.1.0").to_string();
+    let app_version = option_env!("CARGO_PKG_VERSION")
+        .unwrap_or("0.1.0")
+        .to_string();
 
     // Check if online (best-effort — the sync worker updates this)
     let is_online = state.sync.get_status().is_online;
@@ -333,17 +373,33 @@ pub async fn send_heartbeat_to_cloud(
         let device_id = get_or_create_device_id(&conn)?;
 
         let pending_count: i32 = conn
-            .query_row("SELECT COUNT(*) FROM sync_outbox WHERE status = 'PENDING'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE status = 'PENDING'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap_or(0);
         let failed_count: i32 = conn
-            .query_row("SELECT COUNT(*) FROM sync_outbox WHERE status = 'FAILED'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE status = 'FAILED'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap_or(0);
         let conflict_count: i32 = conn
-            .query_row("SELECT COUNT(*) FROM sync_conflict WHERE resolved_at IS NULL", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sync_conflict WHERE resolved_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
             .unwrap_or(0);
 
         let last_sync_at: Option<String> = conn
-            .query_row("SELECT value FROM sync_settings WHERE key = 'last_sync_at'", [], |row| row.get(0))
+            .query_row(
+                "SELECT value FROM sync_settings WHERE key = 'last_sync_at'",
+                [],
+                |row| row.get(0),
+            )
             .ok()
             .filter(|s: &String| !s.is_empty());
 
@@ -359,10 +415,15 @@ pub async fn send_heartbeat_to_cloud(
             )
             .unwrap_or(None);
 
-        let sync_status = if conflict_count > 0 { "CONFLICT" }
-            else if failed_count > 0 { "FAILED" }
-            else if pending_count > 0 { "PENDING" }
-            else { "SYNCED" };
+        let sync_status = if conflict_count > 0 {
+            "CONFLICT"
+        } else if failed_count > 0 {
+            "FAILED"
+        } else if pending_count > 0 {
+            "PENDING"
+        } else {
+            "SYNCED"
+        };
 
         serde_json::json!({
             "deviceId": device_id,
@@ -385,7 +446,10 @@ pub async fn send_heartbeat_to_cloud(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let url = format!("{}/desktop/sync-heartbeat", server_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/desktop/sync-heartbeat",
+        server_url.trim_end_matches('/')
+    );
     let mut req = client.post(&url).json(&heartbeat);
     if let Some(token) = auth_token {
         req = req.header("Authorization", format!("Bearer {}", token));
@@ -445,15 +509,13 @@ fn extract_record_label(payload: &str) -> Option<String> {
     }
 
     // Fallback: show entity_id truncated
-    obj.get("id")
-        .and_then(|v| v.as_str())
-        .map(|s| {
-            if s.len() > 12 {
-                format!("{}…", &s[..12])
-            } else {
-                s.to_string()
-            }
-        })
+    obj.get("id").and_then(|v| v.as_str()).map(|s| {
+        if s.len() > 12 {
+            format!("{}…", &s[..12])
+        } else {
+            s.to_string()
+        }
+    })
 }
 
 /// Get the sync outbox queue entries (pending, syncing, failed, conflict).
@@ -529,9 +591,7 @@ pub async fn retry_sync_outbox_entry(
 /// Retry all failed/conflict sync outbox entries at once.
 /// Returns the number of entries reset to PENDING.
 #[tauri::command]
-pub async fn retry_all_sync_outbox(
-    state: State<'_, Arc<AppState>>,
-) -> Result<i32, String> {
+pub async fn retry_all_sync_outbox(state: State<'_, Arc<AppState>>) -> Result<i32, String> {
     let conn = state.db.conn().map_err(|e| e.to_string())?;
     let affected = conn
         .execute(

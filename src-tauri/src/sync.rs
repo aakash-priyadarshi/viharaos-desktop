@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
 
-use crate::db::Database;
 use crate::db::models::SyncStatus;
+use crate::db::Database;
 
 pub struct SyncEngine {
     db: Arc<Database>,
@@ -40,7 +40,8 @@ impl SyncEngine {
         }
     }
 
-    /// Get the remote server URL from settings
+    /// Get the remote server URL from settings, falling back to the production
+    /// cloud API if no server_url has been configured locally.
     fn get_server_url(&self) -> Option<String> {
         let conn = self.db.conn().ok()?;
         let url: String = conn
@@ -50,7 +51,11 @@ impl SyncEngine {
                 |row| row.get(0),
             )
             .ok()?;
-        if url.is_empty() { None } else { Some(url) }
+        if url.is_empty() {
+            Some("https://api.viharaos.com/api".to_string())
+        } else {
+            Some(url)
+        }
     }
 
     /// Get the auth token from settings
@@ -63,7 +68,11 @@ impl SyncEngine {
                 |row| row.get(0),
             )
             .ok()?;
-        if token.is_empty() { None } else { Some(token) }
+        if token.is_empty() {
+            None
+        } else {
+            Some(token)
+        }
     }
 
     /// Check network connectivity by pinging the remote server
@@ -115,14 +124,16 @@ impl SyncEngine {
     pub fn get_status(&self) -> SyncStatus {
         let conn = match self.db.conn() {
             Ok(c) => c,
-            Err(_) => return SyncStatus {
-                enabled: false,
-                last_sync_at: None,
-                pending_count: 0,
-                failed_count: 0,
-                conflict_count: 0,
-                is_online: false,
-            },
+            Err(_) => {
+                return SyncStatus {
+                    enabled: false,
+                    last_sync_at: None,
+                    pending_count: 0,
+                    failed_count: 0,
+                    conflict_count: 0,
+                    is_online: false,
+                }
+            }
         };
 
         let enabled = self.is_enabled();
@@ -200,7 +211,13 @@ impl SyncEngine {
             // this device's sync status. Failure is logged but not fatal.
             if let Some(ref url) = self.get_server_url() {
                 let token = self.get_auth_token();
-                if let Err(e) = crate::commands::heartbeat::send_heartbeat_to_cloud(&state, url, token.as_deref()).await {
+                if let Err(e) = crate::commands::heartbeat::send_heartbeat_to_cloud(
+                    &state,
+                    url,
+                    token.as_deref(),
+                )
+                .await
+                {
                     log::debug!("Heartbeat send failed (best-effort): {}", e);
                 }
             }
@@ -288,10 +305,17 @@ impl SyncEngine {
                                 rusqlite::params![entry.id],
                             );
                         }
-                        log::debug!("Sync push success: {} {} {}", entry.operation, entry.entity_type, entry.entity_id);
+                        log::debug!(
+                            "Sync push success: {} {} {}",
+                            entry.operation,
+                            entry.entity_type,
+                            entry.entity_id
+                        );
                     } else if resp.status().as_u16() == 409 {
                         // Conflict — parse server payload and record it
-                        let server_payload: String = resp.text().await
+                        let server_payload: String = resp
+                            .text()
+                            .await
                             .ok()
                             .filter(|s| !s.trim().is_empty())
                             .and_then(|s| {
@@ -322,14 +346,25 @@ impl SyncEngine {
                                     entry.property_id,
                                 ],
                             ) {
-                                Ok(_) => log::debug!("Conflict row inserted for {} {}", entry.entity_type, entry.entity_id),
-                                Err(e) => log::error!(
+                                Ok(_) => log::debug!(
+                                    "Conflict row inserted for {} {}",
+                                    entry.entity_type,
+                                    entry.entity_id
+                                ),
+                                Err(e) => {
+                                    log::error!(
                                     "Failed to insert sync_conflict for {} {} (property={}): {}",
                                     entry.entity_type, entry.entity_id, entry.property_id, e,
-                                ),
+                                )
+                                }
                             }
                         }
-                        log::warn!("Sync conflict: {} {} {}", entry.operation, entry.entity_type, entry.entity_id);
+                        log::warn!(
+                            "Sync conflict: {} {} {}",
+                            entry.operation,
+                            entry.entity_type,
+                            entry.entity_id
+                        );
                     } else {
                         // Server error — increment retry count
                         let status = resp.status().as_u16();
@@ -443,7 +478,10 @@ impl SyncEngine {
     pub async fn send_heartbeat(&self, state: &Arc<crate::AppState>) {
         if let Some(ref url) = self.get_server_url() {
             let token = self.get_auth_token();
-            if let Err(e) = crate::commands::heartbeat::send_heartbeat_to_cloud(state, url, token.as_deref()).await {
+            if let Err(e) =
+                crate::commands::heartbeat::send_heartbeat_to_cloud(state, url, token.as_deref())
+                    .await
+            {
                 log::debug!("Heartbeat send failed (best-effort): {}", e);
             }
         }
@@ -457,10 +495,8 @@ mod tests {
     use std::sync::Arc;
 
     fn create_engine() -> SyncEngine {
-        let db_path = std::env::temp_dir().join(format!(
-            "viharaos-sync-test-{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let db_path =
+            std::env::temp_dir().join(format!("viharaos-sync-test-{}.db", uuid::Uuid::new_v4()));
         let db = Arc::new(Database::new(&db_path).expect("temp db should initialize"));
         SyncEngine::new(db)
     }
@@ -624,10 +660,7 @@ struct RemoteChange {
 }
 
 /// Apply a remote change to the local SQLite database
-fn apply_remote_change(
-    conn: &rusqlite::Connection,
-    change: &RemoteChange,
-) -> Result<(), String> {
+fn apply_remote_change(conn: &rusqlite::Connection, change: &RemoteChange) -> Result<(), String> {
     match change.operation.as_str() {
         "CREATE" | "UPDATE" => {
             // Upsert the entity into the appropriate table

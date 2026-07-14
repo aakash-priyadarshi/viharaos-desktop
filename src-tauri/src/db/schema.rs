@@ -1,5 +1,5 @@
-use rusqlite::Connection;
 use crate::db::DbResult;
+use rusqlite::Connection;
 
 /// Run all database migrations to create the local SQLite schema.
 /// This schema mirrors the subset of the PostgreSQL schema needed for

@@ -1,10 +1,10 @@
-pub mod schema;
 pub mod models;
+pub mod schema;
 
-use std::path::Path;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
+use std::path::Path;
 use thiserror::Error;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
@@ -30,15 +30,14 @@ pub struct Database {
 
 impl Database {
     pub fn new(path: &Path) -> DbResult<Self> {
-        let manager = SqliteConnectionManager::file(path)
-            .with_init(|c| {
-                c.execute_batch(
-                    "PRAGMA journal_mode = WAL; \
+        let manager = SqliteConnectionManager::file(path).with_init(|c| {
+            c.execute_batch(
+                "PRAGMA journal_mode = WAL; \
                      PRAGMA foreign_keys = ON; \
                      PRAGMA synchronous = NORMAL; \
                      PRAGMA busy_timeout = 5000;",
-                )
-            });
+            )
+        });
         let pool = Pool::builder()
             .max_size(8)
             .build(manager)
@@ -50,9 +49,7 @@ impl Database {
     }
 
     pub fn conn(&self) -> DbResult<r2d2::PooledConnection<SqliteConnectionManager>> {
-        self.pool
-            .get()
-            .map_err(|e| DbError::Pool(e.to_string()))
+        self.pool.get().map_err(|e| DbError::Pool(e.to_string()))
     }
 
     fn init_schema(&self) -> DbResult<()> {
