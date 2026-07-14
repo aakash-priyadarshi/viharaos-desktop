@@ -1,6 +1,6 @@
 [package]
 name = "viharaos-desktop"
-version = "0.2.1"
+version = "0.2.2"
 description = "ViharaOS Desktop — Offline-first Tauri shell"
 authors = ["ViharaOS"]
 edition = "2021"
