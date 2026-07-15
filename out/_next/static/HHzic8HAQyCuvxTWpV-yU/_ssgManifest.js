@@ -1,1 +1,0 @@
-self.__SSG_MANIFEST=new Set(["\u002Ffrontdesk\u002Fregistration-card\u002F[reservationId]"]);self.__SSG_MANIFEST_CB&&self.__SSG_MANIFEST_CB()

@@ -1,6 +1,6 @@
 ﻿{
   "name": "@viharaos/desktop",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "description": "ViharaOS Desktop — Offline-first Tauri shell with SQLite + cloud sync",
   "type": "module",
